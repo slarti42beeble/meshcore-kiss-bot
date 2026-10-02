@@ -1,0 +1,17 @@
+# Runtime data - contains other people's messages, never publish
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
