@@ -13,6 +13,9 @@ contacts to use the channel commands.
   line on every connect, since the KISS modem firmware does not remember them across reboots.
 - Command bot on a hashtag channel: `!ping` (with hop count, SNR, RSSI), `!time`, `!uptime`,
   `!stats`, `!echo <text>`, `!help`.
+- The same commands also work by **direct message** to the bot (the `!` is optional there),
+  once the bot has heard the sender's advert. Replies come back as direct messages; the bot
+  ACKs incoming DMs like any MeshCore node, so the sender's app shows them as delivered.
 - Opt-in direct heartbeats per user: `!heartbeaton`, `!heartbeatoff`, `!heartbeat` (status).
   Limited to 24 hours per request, renewable. Subscriptions survive restarts.
 - Everything heard and sent is logged to SQLite (timestamp, sender, text, hops, repeater path,
