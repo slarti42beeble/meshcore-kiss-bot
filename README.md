@@ -54,7 +54,9 @@ message sent along the reverse of the repeater path the user's last channel mess
   repeater on the path has gone away), the bot does what the MeshCore companion apps do: it
   forgets that route and resends the message once by **flood**. The recipient answers a flood
   with the route it took, which becomes the new direct route. Until a route is learned again,
-  heartbeats are flooded. The bot also sends each user's node the route back to the bot
+  heartbeats are flooded, backing off while nobody answers: the next flood waits 2x, then 4x,
+  8x... the heartbeat interval, up to `--flood-backoff-max` minutes (default 30). Hearing from
+  them again (an ACK, a channel message or `!heartbeaton`) resets it. The bot also sends each user's node the route back to the bot
   (a reciprocal path), so their ACKs come back direct instead of being flooded. The ACK wait is estimated from airtime; override it with
   `--ack-timeout` if you see many `acked_late` rows in the log.
 - The sender name in a channel message is not authenticated, so someone could enable heartbeats
