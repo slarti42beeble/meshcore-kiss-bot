@@ -169,9 +169,26 @@ class RemoteNode:
         self.dead_paths = set()                # direct routes that no longer get through
         self.route_to_bot = None               # learned from the bot's PATH packets
         self.ack_routes = []                   # route type of each ACK she sent
+        self.acks_received = []                # (ack, route type) of ACKs the bot sent her
+
+    def send_dm(self, text, ts, attempt=0, path=b"", direct=False):
+        """She sends the bot a direct message: flooded (arriving with `path`)
+        or, once she has a route, direct (repeaters strip the path on the way).
+        Returns the ACK she expects back."""
+        pkt, ack = m.build_txt_msg(self.modem.pub, self.pub, self.secret, text, ts, attempt)
+        if direct:
+            pkt = bytes([(m.PAYLOAD_TXT_MSG << 2) | m.ROUTE_DIRECT, 0]) + pkt[2:]
+        else:
+            pkt = bytes([pkt[0], len(path)]) + path + pkt[2:]
+        self.modem.inject(pkt)
+        return ack
 
     def __call__(self, packet):
         p = m.parse_packet(packet)
+        if p["ptype"] == m.PAYLOAD_ACK:     # ACK packets carry no address
+            if self.reachable:
+                self.acks_received.append((p["payload"][:4], p["route"]))
+            return
         if p["ptype"] not in (m.PAYLOAD_TXT_MSG, m.PAYLOAD_PATH) or p["payload"][0] != self.pub[0]:
             return
         flood = p["route"] == m.ROUTE_FLOOD
@@ -179,8 +196,10 @@ class RemoteNode:
             return
         if p["ptype"] == m.PAYLOAD_PATH:   # the bot telling her how to reach it
             pl = p["payload"]
-            path, plb, extra_type, _ = m.parse_path_return(m.mac_then_decrypt(self.secret, pl[2:4], pl[4:]))
+            path, plb, extra_type, extra = m.parse_path_return(m.mac_then_decrypt(self.secret, pl[2:4], pl[4:]))
             self.route_to_bot = path
+            if extra_type == m.PAYLOAD_ACK:
+                self.acks_received.append((extra[:4], p["route"]))
             return
         body = open_dm(packet, self.secret)[3]
         ack = hashlib.sha256(body + self.modem.pub).digest()[:4]
@@ -381,6 +400,50 @@ async def main():
     modem.inject(bytes([(m.PAYLOAD_GRP_TXT << 2) | m.ROUTE_FLOOD, 0]) + other.encrypt("Eve: !ping"))
     await asyncio.sleep(0.2)
     check(not db.db.execute("SELECT 1 FROM messages WHERE sender='Eve'").fetchall(), "messages for a different channel are ignored")
+
+    # --- direct messages to the bot (Alice's heartbeats off, so only DM traffic is on air)
+    db.remove_sub("Alice")
+    await asyncio.sleep(0.6)
+    n = len(modem.sent)
+    ts = int(time.time()) + 1000
+    ack = alice.send_dm("!ping", ts, path=b"\x77")
+    await asyncio.sleep(0.5)
+    check((ack, m.ROUTE_FLOOD) in alice.acks_received and alice.route_to_bot == b"\x77",
+          "flooded DM is ACKed with a PATH reply giving her the route to the bot")
+    pongs = [p for p, a, t in dms_in(modem, n, alice_secret) if "pong" in t]
+    check(len(pongs) == 1 and pongs[0]["route"] == m.ROUTE_DIRECT and pongs[0]["path"] == b"\x77",
+          "!ping by DM is answered by direct message along the reverse of her path")
+    check(db.db.execute("SELECT 1 FROM messages WHERE direction='rx' AND channel='dm:Alice' "
+                        "AND command='!ping'").fetchone() is not None, "DM logged as channel dm:Alice")
+
+    n, before = len(modem.sent), len(alice.acks_received)
+    ack2 = alice.send_dm("!ping", ts, attempt=1, path=b"\x77")   # her app retrying
+    await asyncio.sleep(0.5)
+    check(ack2 in [a for a, r in alice.acks_received[before:]]
+          and not [t for p, a, t in dms_in(modem, n, alice_secret) if "pong" in t],
+          "a retried DM is ACKed again but answered only once")
+
+    n, before = len(modem.sent), len(alice.acks_received)
+    ack3 = alice.send_dm("time", ts + 1, direct=True)
+    await asyncio.sleep(0.5)
+    check((ack3, m.ROUTE_DIRECT) in alice.acks_received[before:], "DM that arrived direct is ACKed direct")
+    check([t for p, a, t in dms_in(modem, n, alice_secret) if t.endswith((" PST", " PDT"))],
+          "'time' without the ! works by DM")
+
+    n = len(modem.sent)
+    rows = db.db.execute("SELECT COUNT(*) FROM messages WHERE direction='rx'").fetchone()[0]
+    stranger = raw_pub(Ed25519PrivateKey.generate())
+    RemoteNode(modem, stranger, hashlib.sha256(stranger).digest(), b"").send_dm("!ping", ts)
+    await asyncio.sleep(0.5)
+    check(len(modem.sent) == n and db.db.execute("SELECT COUNT(*) FROM messages WHERE direction='rx'").fetchone()[0] == rows,
+          "DM from a node whose advert was never heard is ignored")
+
+    alice.send_dm("heartbeaton", ts + 2, direct=True)
+    await asyncio.sleep(0.5)
+    sub = db.get_sub("Alice")
+    check(sub is not None and bytes.fromhex(sub["pubkey"]) == alice_pub and sub["path"] == "77",
+          "!heartbeaton by DM subscribes her with her proven key and known route")
+    db.remove_sub("Alice")
 
     # --- everything was logged
     rx, senders, tx = db.summary()

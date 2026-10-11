@@ -38,7 +38,8 @@ logged before this change have UTC `iso` values ending in `Z`.
   Radio settings are NOT persisted by the firmware, so they are re-sent on every (re)connect.
   `run()` reconnects with backoff.
 - **Tasks**: `serial_reader` (owns the port; RX), `tx_worker` (single TX queue), `heartbeat`,
-  `advert_task`. Before `serial_reader` starts, `send_hw_command` reads the port directly; after,
+  `advert_task`, `ack_monitor`, `dm_worker` (incoming DMs; decrypting needs a modem key exchange,
+  so `handle_rx` queues them). Before `serial_reader` starts, `send_hw_command` reads the port directly; after,
   `hw_request` has the reader hand responses back through a future (`hw_waiter`).
 - **TX rule**: the modem accepts ONE pending packet at a time (a second gets Error/TxBusy), so
   everything goes through `tx_queue` and waits for the TxDone event (20 s timeout).
@@ -67,6 +68,10 @@ logged before this change have UTC `iso` values ending in `Z`.
   answered with a PATH packet (type 8): `dest hash | src hash | MAC(2) | AES(plb | path |
   extra_type | extra)` where path = route the flood took to reach them (use as-is for direct)
   and extra = the ACK (extra_type 3).
+- **Incoming DM** (TXT_MSG to us): sender candidates = heard chat nodes whose pubkey starts with
+  the src hash; the MAC picks the real one. flags >> 2 = text type (only 0, plain, is handled).
+  ACK = SHA256(`ts | flags | text | sender pubkey`)[:4]. Flooded DM -> flooded PATH reply
+  (route = the DM's path, extra = ACK). Direct DM -> ACK packet, direct if we know a route.
 - **Advert**: `pubkey(32) | ts(4) | Ed25519 signature(64) | appdata`, signature over
   `pubkey | ts | appdata`. App flags: low nibble = node type (1 = chat), 0x10 lat/lon, 0x20/0x40
   feature words, 0x80 name present.
@@ -91,13 +96,18 @@ logged before this change have UTC `iso` values ending in `Z`.
   need the bot as a contact to see its DMs).
 - Airtime protection: per-sender cooldown, global replies/min, `--max-heartbeat-subs` (default 5),
   jitter delay before replies, `MAX_QUEUED_TX` cap, advert minimum gap.
+- **Commands by DM**: same command table and rate limits as the channel (`run_command`); `!` is
+  optional; unknown text gets the `!help` reply. Replies go via `send_direct` (ACK-tracked,
+  flood fallback). Retries of a DM (same ts/text, attempt+1) are re-ACKed but answered once.
+  `!heartbeaton` by DM uses the sender's proven key. Routes for non-subscribers live in
+  memory (`Bot.routes`); subscribers' routes stay in `hb_subs`.
 - Message logging is a core requirement: every rx and tx row is stored, including heartbeats
   (`channel='dm:<name>'`) and adverts (`channel='advert'`).
 
 ## Known limitations / ideas
 
 - Channel sender names are **not authenticated**: anyone can enable heartbeats under another
-  user's name. If two nodes advertise the same name the bot refuses.
+  user's name (DMs are authenticated, so `!heartbeaton` by DM is the safe way). If two nodes advertise the same name the bot refuses.
 - **Flood backoff**: while a user has no known route and floods go unACKed, flooded heartbeats
   wait 2x, 4x, 8x... the interval (`flood_delay`), capped at `--flood-backoff-max` minutes
   (default 30). Reset by any ACK from them, a channel message, `!heartbeaton` or `!heartbeatoff`.
