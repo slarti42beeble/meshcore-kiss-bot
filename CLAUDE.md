@@ -16,7 +16,10 @@ python3 test_simulated_modem.py      # end-to-end test against a fake modem, no 
 ```
 
 Radio options (`--freq --bw --sf --cr --power`) are all required and must match the target mesh.
-Add `-v` for debug logging with raw packet hex. Dependencies: `pyserial`, `cryptography`.
+Add `-v` for debug logging with raw packet hex. Dependencies: `pyserial`, `cryptography`, `tzdata`
+(Windows has no system time zone database). Times shown to users and the `messages.iso` column use
+`--timezone` (default `America/Los_Angeles`, owner's choice); `messages.ts` stays unix time. Rows
+logged before this change have UTC `iso` values ending in `Z`.
 
 ## Status — read this first
 

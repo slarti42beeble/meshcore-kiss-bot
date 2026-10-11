@@ -19,6 +19,9 @@ contacts to use the channel commands.
   SNR/RSSI, command matched), plus an optional rotating text log.
 - Per-sender cooldown and a global reply cap to protect airtime.
 - Automatic reconnect to the modem, re-applying radio settings each time.
+- Times (`!time`, heartbeats, the log's `iso` column) are in Pacific time by default; change with
+  `--timezone` (any IANA name, e.g. `America/Denver`). Windows needs the `tzdata` package
+  (included in `requirements.txt`).
 
 ## Requirements
 

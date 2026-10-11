@@ -67,7 +67,7 @@ Usage:
       --name MeshBot --freq 910.525 --bw 62.5 --sf 7 --cr 5 --power 22 \\
       --db meshbot_messages.db --log-file meshbot.log
 
-Requires: pip install pyserial cryptography --break-system-packages
+Requires: pip install pyserial cryptography tzdata --break-system-packages
 """
 
 import argparse
@@ -84,6 +84,8 @@ import struct
 import sys
 import time
 from collections import OrderedDict, deque
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -425,7 +427,8 @@ def build_advert(pub: bytes, signature: bytes, ts: bytes, app: bytes) -> bytes:
 # --------------------------------------------------------------------------
 
 class BotDB:
-    def __init__(self, path: str):
+    def __init__(self, path: str, tz=timezone.utc):
+        self.tz = tz                    # zone for the human-readable iso column
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -433,7 +436,7 @@ class BotDB:
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts          REAL    NOT NULL,   -- unix time logged by the bot
-                iso         TEXT    NOT NULL,   -- same, ISO-8601 UTC
+                iso         TEXT    NOT NULL,   -- same, ISO-8601 local time with UTC offset
                 direction   TEXT    NOT NULL,   -- 'rx' or 'tx'
                 channel     TEXT    NOT NULL,   -- '#bot', 'dm:<name>' or 'advert'
                 sender      TEXT,
@@ -479,7 +482,7 @@ class BotDB:
         now = time.time()
         row = {
             "ts": now,
-            "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "iso": datetime.fromtimestamp(now, self.tz).isoformat(timespec="seconds"),
             "sender": None, "sender_ts": None, "hops": None, "path": None,
             "snr": None, "rssi": None, "command": None, "in_reply_to": None,
             "status": None,
@@ -589,6 +592,7 @@ class Bot:
         self.chan = Channel(args.channel)
         self.name = args.name
         self.start = time.time()
+        self.tz = ZoneInfo(args.timezone)
 
         self.seen = OrderedDict()        # dedupe: same packet arrives via many paths
         self.last_reply = {}             # per-sender cooldown
@@ -615,7 +619,7 @@ class Bot:
         self.commands = {
             "!ping": self.cmd_ping,
             "!help": lambda c: "Commands: !ping !time !uptime !stats !echo <text> !heartbeaton !heartbeatoff !heartbeat",
-            "!time": lambda c: time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            "!time": lambda c: datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
             "!uptime": lambda c: f"up {fmt_duration(time.time() - self.start)}",
             "!stats": self.cmd_stats,
             "!echo": lambda c: c["args"][:100] if c["args"] else "usage: !echo <text>",
@@ -1043,7 +1047,7 @@ class Bot:
                              f"Send !heartbeaton in {self.chan.name} for another {self.args.heartbeat_hours:g}h",
                         "heartbeat_end")
 
-            stamp = time.strftime("%H:%M:%S UTC", time.gmtime(now))
+            stamp = datetime.fromtimestamp(now, self.tz).strftime("%H:%M:%S %Z")
             for sub in self.db.active_subs(now):
                 if self.tx_queue.qsize() >= MAX_QUEUED_TX:
                     log.warning("TX queue backed up; skipping remaining heartbeats this round")
@@ -1137,7 +1141,7 @@ class Bot:
 # --------------------------------------------------------------------------
 
 async def amain(args):
-    db = BotDB(args.db)
+    db = BotDB(args.db, ZoneInfo(args.timezone))
     log.info("database: %s", args.db)
     await Bot(args, db).run()
 
@@ -1159,6 +1163,9 @@ def main():
                    help="SQLite database: message log, heard nodes, heartbeat subscriptions "
                         "(default meshbot_messages.db)")
     p.add_argument("--log-file", help="also write the text log to this file (rotating, 5 x 2 MB)")
+    p.add_argument("--timezone", default="America/Los_Angeles",
+                   help="time zone for !time, heartbeats and the database's iso column "
+                        "(default America/Los_Angeles, i.e. Pacific; PST/PDT handled automatically)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging, including raw packet hex")
 
     p.add_argument("--cooldown", type=float, default=5.0, help="seconds between replies to the same sender (default 5)")
@@ -1178,6 +1185,10 @@ def main():
     p.add_argument("--advert-interval", type=float, default=12.0,
                    help="hours between the bot's own adverts; 0 = only at startup and on demand (default 12)")
     args = p.parse_args()
+    try:
+        ZoneInfo(args.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        p.error(f"unknown time zone {args.timezone!r} (on Windows, run: pip install tzdata)")
 
     handlers = [logging.StreamHandler()]
     if args.log_file:
