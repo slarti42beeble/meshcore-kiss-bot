@@ -47,7 +47,13 @@ message sent along the reverse of the repeater path the user's last channel mess
   air; if it hasn't heard one for the sender's name it asks them to send an advert.
 - The user's node generally needs the bot as a **contact** to display its direct messages, so
   the bot sends its own advert at startup, periodically, and when someone enables heartbeats.
-- Delivery is best-effort. The bot does not process ACKs or retry.
+- Every direct message waits for the recipient's ACK. If none arrives (out of range, or a
+  repeater on the path has gone away), the bot does what the MeshCore companion apps do: it
+  forgets that route and resends the message once by **flood**. The recipient answers a flood
+  with the route it took, which becomes the new direct route. Until a route is learned again,
+  heartbeats are flooded. The bot also sends each user's node the route back to the bot
+  (a reciprocal path), so their ACKs come back direct instead of being flooded. The ACK wait is estimated from airtime; override it with
+  `--ack-timeout` if you see many `acked_late` rows in the log.
 - The sender name in a channel message is not authenticated, so someone could enable heartbeats
   under another user's name. Slots are capped (`--max-heartbeat-subs`) to limit the impact.
 
@@ -71,4 +77,4 @@ sqlite3 -header -column meshbot_messages.db \
 
 ## License
 
-MIT, see `LICENSE`.
+MIT, see `LICENSE.md`.

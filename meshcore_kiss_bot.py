@@ -33,7 +33,18 @@ packets on the air and remembers each chat node's name -> public key. When
 For her node to accept and show the bot's direct messages, she normally has to
 have the bot as a contact, so the bot also broadcasts its own signed advert
 (at startup, every --advert-interval hours, and when someone enables
-heartbeats). Delivery is best-effort: the bot does not process ACKs or retry.
+heartbeats).
+
+ACKs and flood fallback: every direct message is tracked until the
+recipient's ACK comes back. If it doesn't (out of range, or a repeater on the
+path is gone), the bot does what MeshCore companion clients do: it forgets
+that route and resends the message once by FLOOD. The recipient answers a
+flood with a PATH packet carrying the ACK and the route the flood took, which
+becomes the new direct route. Until a route is learned again (or the user
+next speaks in the channel), heartbeats are flooded. The bot also sends each
+user's node a PATH packet with the route back to the bot, so their ACKs come
+back direct instead of being flooded. --ack-timeout overrides
+the airtime-based ACK wait.
 
 MESSAGE LOGGING: every channel message heard, every message sent (channel
 replies, direct heartbeats and adverts) is written to a SQLite database
@@ -65,6 +76,8 @@ import hashlib
 import hmac
 import logging
 import logging.handlers
+import math
+import os
 import random
 import sqlite3
 import struct
@@ -218,8 +231,11 @@ ROUTE_DIRECT = 2
 ROUTE_TRANSPORT_DIRECT = 3
 
 PAYLOAD_TXT_MSG = 2
+PAYLOAD_ACK = 3
 PAYLOAD_ADVERT = 4
 PAYLOAD_GRP_TXT = 5
+PAYLOAD_PATH = 8
+PAYLOAD_MULTIPART = 10
 
 ADV_TYPE_CHAT = 1
 
@@ -236,6 +252,26 @@ def encrypt_then_mac(secret32: bytes, plaintext: bytes):
     enc = Cipher(algorithms.AES(secret32[:16]), modes.ECB()).encryptor()
     ct = enc.update(plaintext) + enc.finalize()
     return hmac.new(secret32, ct, hashlib.sha256).digest()[:2], ct
+
+
+def mac_then_decrypt(secret32: bytes, mac: bytes, ct: bytes):
+    """Inverse of encrypt_then_mac. Returns the (zero padded) plaintext, or
+    None if the MAC doesn't match."""
+    if not ct or len(ct) % 16:
+        return None
+    if not hmac.compare_digest(mac, hmac.new(secret32, ct, hashlib.sha256).digest()[:2]):
+        return None
+    d = Cipher(algorithms.AES(secret32[:16]), modes.ECB()).decryptor()
+    return d.update(ct) + d.finalize()
+
+
+def lora_airtime(n_bytes: int, sf: int, bw_hz: float, cr: int, preamble: int = 16) -> float:
+    """Approximate LoRa time on air in seconds (explicit header, CRC on, `cr`
+    in its 5-8 form). MeshCore uses a 16-symbol preamble."""
+    tsym = (1 << sf) / bw_hz
+    ldro = 1 if tsym > 0.016 else 0
+    n = 8 + max(math.ceil((8 * n_bytes - 4 * sf + 44) / (4 * (sf - 2 * ldro))) * cr, 0)
+    return (preamble + 4.25 + n) * tsym
 
 
 class Channel:
@@ -309,16 +345,50 @@ def reverse_path(path: bytes, plb: int) -> bytes:
     return b"".join(reversed(groups))
 
 
-def build_direct_txt(dest_pub: bytes, src_pub: bytes, secret32: bytes, text: str,
-                     path: bytes, plb: int) -> bytes:
-    """A DIRECT-routed plain-text message (TXT_MSG) to dest_pub, sent back
-    along the reverse of `path` (the path the recipient's packet arrived by).
-    Payload: dest hash(1) | src hash(1) | MAC(2) | AES(timestamp|flags|text)."""
-    raw = struct.pack("<IB", int(time.time()), 0) + text.encode("utf-8")  # flags 0 = plain text, attempt 0
+def build_txt_msg(dest_pub: bytes, src_pub: bytes, secret32: bytes, text: str, ts: int,
+                  attempt: int, path: bytes = None, plb: int = 0):
+    """A plain-text message (TXT_MSG) to dest_pub. With a `path` (the path
+    the recipient's packet arrived by) it is DIRECT-routed back along the
+    reverse of it; with path=None it is flooded.
+    Payload: dest hash(1) | src hash(1) | MAC(2) | AES(timestamp|flags|text).
+    Returns (packet, expected_ack): the recipient ACKs with the first 4 bytes
+    of SHA256(timestamp | flags | text | sender pubkey)."""
+    raw = struct.pack("<IB", ts, attempt & 0x03) + text.encode("utf-8")  # flags: plain text, attempt no.
+    ack = hashlib.sha256(raw + src_pub).digest()[:4]
     mac, ct = encrypt_then_mac(secret32, raw)
     payload = bytes([dest_pub[0], src_pub[0]]) + mac + ct
+    if path is None:
+        return bytes([(PAYLOAD_TXT_MSG << 2) | ROUTE_FLOOD, 0x00]) + payload, ack
     header = (PAYLOAD_TXT_MSG << 2) | ROUTE_DIRECT
+    return bytes([header, plb]) + reverse_path(path, plb) + payload, ack
+
+
+def build_path_return(dest_pub: bytes, src_pub: bytes, secret32: bytes, route_to_us: bytes,
+                      route_plb: int, path: bytes, plb: int) -> bytes:
+    """A DIRECT-routed PATH packet telling dest_pub how to reach us
+    (`route_to_us`, in from-them-to-us order), so they can send their ACKs
+    direct instead of flooding them. Sent back along the reverse of `path`,
+    like build_txt_msg. No extra data: 0xFF + 4 random bytes, as the firmware
+    does, keeps the packet unique."""
+    data = bytes([route_plb]) + route_to_us + b"\xff" + os.urandom(4)
+    mac, ct = encrypt_then_mac(secret32, data)
+    payload = bytes([dest_pub[0], src_pub[0]]) + mac + ct
+    header = (PAYLOAD_PATH << 2) | ROUTE_DIRECT
     return bytes([header, plb]) + reverse_path(path, plb) + payload
+
+
+def parse_path_return(plaintext: bytes):
+    """Decrypted PATH payload: path-length byte | path | extra type | extra.
+    The path is the route a flood from us took to reach the sender, i.e. the
+    route to use for direct messages to them. Returns (path, plb,
+    extra_type, extra) or None."""
+    if not plaintext:
+        return None
+    plb = plaintext[0]
+    n = (plb & 0x3F) * ((plb >> 6) + 1)
+    if len(plaintext) < 1 + n + 1:
+        return None
+    return plaintext[1:1 + n], plb, plaintext[1 + n] & 0x0F, plaintext[2 + n:]
 
 
 def parse_advert(payload: bytes):
@@ -375,7 +445,8 @@ class BotDB:
                 rssi        INTEGER,            -- dBm, as heard by this radio
                 command     TEXT,               -- command matched, if any
                 in_reply_to INTEGER,            -- id of the rx row answered
-                status      TEXT                -- tx only: sent / failed / unconfirmed
+                status      TEXT                -- tx only: sent / failed / unconfirmed;
+                                                -- direct msgs also: acked / no_ack / acked_late
             );
             CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
@@ -394,8 +465,9 @@ class BotDB:
             CREATE TABLE IF NOT EXISTS hb_subs (
                 name        TEXT PRIMARY KEY,
                 pubkey      TEXT NOT NULL,      -- hex
-                path        TEXT NOT NULL,      -- hex; path of their latest channel message
-                plb         INTEGER NOT NULL,   -- raw path-length byte for that path
+                path        TEXT NOT NULL,      -- hex; path from them to us (sent along in reverse)
+                plb         INTEGER NOT NULL,   -- raw path-length byte for that path; -1 = no
+                                                -- known route, heartbeats are flooded
                 enabled_at  REAL NOT NULL,
                 expires_at  REAL NOT NULL
             );
@@ -468,6 +540,10 @@ class BotDB:
     def get_sub(self, name):
         return self.db.execute("SELECT * FROM hb_subs WHERE name=?", (name,)).fetchone()
 
+    def sub_name_for_key(self, pubkey: bytes):
+        row = self.db.execute("SELECT name FROM hb_subs WHERE pubkey=?", (pubkey.hex(),)).fetchone()
+        return row["name"] if row else None
+
     def remove_sub(self, name) -> bool:
         cur = self.db.execute("DELETE FROM hb_subs WHERE name=?", (name,))
         self.db.commit()
@@ -498,6 +574,13 @@ TX_DONE_TIMEOUT = 20.0   # seconds to wait for the modem's TxDone event
 MAX_QUEUED_TX = 8
 ADVERT_MIN_GAP = 600     # never advert more often than this (seconds)
 
+# How long to wait for a direct message's ACK, modelled on the companion
+# firmware: base + factor x packet airtime (per hop for direct routes).
+ACK_BASE = 0.5
+ACK_FLOOD_FACTOR = 16.0
+ACK_DIRECT_HOP_FACTOR = 6.0
+ACK_DIRECT_HOP_EXTRA = 0.25
+
 
 class Bot:
     def __init__(self, args, db: BotDB):
@@ -524,6 +607,9 @@ class Bot:
         self.decoder = None
         self.pubkey = None                 # modem identity, read on connect
         self.secrets = {}                  # remote pubkey -> shared secret
+        self.pending_acks = {}             # expected ACK -> direct message awaiting it
+        self.expired_acks = OrderedDict()  # ACKs we gave up on: ack -> (name, tx row id)
+        self.route_shared = {}             # name -> (path hex, plb) we last told them reaches us
 
         # command table: "!cmd" -> handler(ctx) -> reply text
         self.commands = {
@@ -594,12 +680,15 @@ class Bot:
         async with self.write_lock:  # pyserial writes from threads aren't atomic
             await asyncio.get_running_loop().run_in_executor(None, self.ser.write, frame)
 
-    def enqueue(self, text, *, packet=None, label=None, reply_to=None, cmd=None, jitter=True):
+    def enqueue(self, text, *, packet=None, label=None, reply_to=None, cmd=None, jitter=True,
+                dm=None, route=None):
         """Queue something for transmission. packet=None means 'post `text`
         to the channel'; otherwise packet is a ready-built raw MeshCore packet
-        (a direct message or advert) and text/label are just for the log."""
+        (a direct message or advert) and text/label are just for the log.
+        dm is the ACK-tracking record of a direct message (see send_direct)."""
         self.tx_queue.put_nowait({"text": text, "packet": packet, "label": label,
-                                  "reply_to": reply_to, "cmd": cmd, "jitter": jitter})
+                                  "reply_to": reply_to, "cmd": cmd, "jitter": jitter,
+                                  "dm": dm, "route": route})
 
     async def hw_request(self, sub_cmd: int, payload: bytes, expected_resp: int, timeout: float = 5.0):
         """SetHardware request issued while the serial reader task owns the
@@ -636,6 +725,43 @@ class Bot:
         self.db.note_node(pub, name, adv_type)
         log.debug("heard advert: %s (type %d) %s", name, adv_type, pub.hex()[:12])
 
+    def handle_ack(self, ack: bytes):
+        dm = self.pending_acks.pop(ack, None)
+        if dm is None:
+            late = self.expired_acks.pop(ack, None)
+            if late:  # it did get there, we just stopped waiting too soon
+                name, row = late
+                self.db.set_status(row, "acked_late")
+                log.info("late ACK from %s; if this happens often, raise --ack-timeout", name)
+            return  # otherwise: someone else's ACK, or a duplicate copy
+        if dm["row"] is not None:
+            self.db.set_status(dm["row"], "acked")
+        log.info("ACK from %s (%s)", dm["sub"]["name"], "flood" if dm["hops"] is None else "direct")
+
+    def handle_path(self, payload: bytes):
+        """A PATH packet: someone answering one of our flooded messages with
+        the route it took to reach them (and, inside, their ACK)."""
+        if len(payload) < 4 + 16 or payload[0] != self.pubkey[0]:
+            return
+        if self.seen_before(hashlib.sha256(payload).digest()):
+            return
+        # only nodes we've messaged can be answering us, so their secret is cached
+        for pub, secret in list(self.secrets.items()):
+            if pub[0] != payload[1]:
+                continue
+            parsed = parse_path_return(mac_then_decrypt(secret, payload[2:4], payload[4:]))
+            if not parsed:
+                continue
+            path, plb, extra_type, extra = parsed
+            name = self.db.sub_name_for_key(pub)
+            if name:
+                # stored in from-them-to-us orientation, like a channel path
+                self.db.refresh_sub_path(name, reverse_path(path, plb), plb)
+                log.info("learned new route to %s: %d hop(s) %s", name, plb & 0x3F, path.hex() or "(direct)")
+            if extra_type == PAYLOAD_ACK and len(extra) >= 4:
+                self.handle_ack(extra[:4])
+            return
+
     def handle_rx(self, raw: bytes, meta):
         """raw = one received MeshCore packet; meta = (snr, rssi) or None."""
         snr, rssi = meta if meta else (None, None)
@@ -645,6 +771,17 @@ class Bot:
             return
         if pkt["ptype"] == PAYLOAD_ADVERT:
             self.handle_advert(pkt["payload"])
+            return
+        if pkt["ptype"] == PAYLOAD_ACK:
+            self.handle_ack(pkt["payload"][:4])
+            return
+        if pkt["ptype"] == PAYLOAD_MULTIPART:
+            # newer firmware sends extra ACK copies as MULTIPART: (remaining << 4 | type) | ack
+            if pkt["payload"] and pkt["payload"][0] & 0x0F == PAYLOAD_ACK:
+                self.handle_ack(pkt["payload"][1:5])
+            return
+        if pkt["ptype"] == PAYLOAD_PATH:
+            self.handle_path(pkt["payload"])
             return
         if pkt["ptype"] != PAYLOAD_GRP_TXT:
             return
@@ -774,33 +911,115 @@ class Bot:
                 label, logged = self.chan.name, full.partition(": ")[2]
             else:                           # prebuilt: direct message / advert
                 packet, label, logged = item["packet"], item["label"], item["text"]
+            dm = item["dm"]
 
             self.tx_done.clear()
             self.tx_ok = None
             await self.serial_write(kiss_encode(KISS_CMD_DATA, packet))
             row = self.db.add(direction="tx", channel=label, sender=self.name, text=logged,
-                              command=item["cmd"], in_reply_to=item["reply_to"], status="sent")
-            log.info("TX [%s]: %s", label, logged)
+                              command=item["cmd"], in_reply_to=item["reply_to"], status="sent",
+                              hops=dm["hops"] if dm else None, path=dm["out_path"] if dm else None)
+            if dm:
+                dm["row"] = row
+            log.info("TX [%s%s]: %s", label, f", {item['route']}" if item["route"] else "", logged)
+            status = "sent"
             try:
                 await asyncio.wait_for(self.tx_done.wait(), TX_DONE_TIMEOUT)
                 if not self.tx_ok:
                     log.warning("modem reported TX failure")
-                    self.db.set_status(row, "failed")
+                    status = "failed"
             except asyncio.TimeoutError:
                 log.warning("no TxDone from modem within %.0fs", TX_DONE_TIMEOUT)
-                self.db.set_status(row, "unconfirmed")
+                status = "unconfirmed"
+            if status != "sent":
+                self.db.set_status(row, status)
+            if dm:
+                # the ACK clock starts once the packet is actually on air
+                dm["status"] = status
+                dm["deadline"] = time.monotonic() + self.ack_timeout(len(packet), dm["hops"])
 
     # ---- heartbeats (direct, opt-in, per user)
-    async def send_direct(self, sub, text: str, cmd: str):
-        """Build and queue a DIRECT-routed message to a subscriber."""
+    async def send_direct(self, sub, text: str, cmd: str, *, ts=None, attempt=0, flood=None):
+        """Build and queue a text message to a subscriber: DIRECT along their
+        known route, or flooded if the route is unknown (plb < 0) or
+        flood=True. It is then tracked until its ACK arrives (ack_monitor)."""
+        pub = bytes.fromhex(sub["pubkey"])
         try:
-            secret = await self.shared_secret(bytes.fromhex(sub["pubkey"]))
+            secret = await self.shared_secret(pub)
         except Exception as e:
             log.warning("can't send to %s: key exchange failed (%s)", sub["name"], e)
             return
-        packet = build_direct_txt(bytes.fromhex(sub["pubkey"]), self.pubkey, secret, text,
-                                  bytes.fromhex(sub["path"]), sub["plb"])
-        self.enqueue(text, packet=packet, label=f"dm:{sub['name']}", cmd=cmd, jitter=False)
+        if flood is None:
+            flood = sub["plb"] < 0
+        ts = int(time.time()) if ts is None else ts
+        path = None if flood else bytes.fromhex(sub["path"])
+        if not flood and self.route_shared.get(sub["name"]) != (sub["path"], sub["plb"]):
+            # Their node knows us only from our advert, so it would flood its
+            # ACKs. Tell it the route to us first (the path we hold is the one
+            # from them to us) so the ACKs come back direct.
+            self.route_shared[sub["name"]] = (sub["path"], sub["plb"])
+            hops = sub["plb"] & 0x3F
+            self.enqueue(f"route to me: {sub['path'] or 'direct'} ({hops} hop{'s' if hops != 1 else ''})",
+                         packet=build_path_return(pub, self.pubkey, secret, path, sub["plb"], path, sub["plb"]),
+                         label=f"dm:{sub['name']}", cmd="path", jitter=False)
+        packet, ack = build_txt_msg(pub, self.pubkey, secret, text, ts, attempt, path, sub["plb"])
+        hops = None if flood else sub["plb"] & 0x3F
+        dm = {"sub": sub, "text": text, "cmd": cmd, "ts": ts, "attempt": attempt, "hops": hops,
+              "out_path": None if flood else reverse_path(path, sub["plb"]).hex(),
+              "row": None, "status": None, "deadline": None}
+        self.pending_acks[ack] = dm
+        route = "flood" if flood else f"direct, {hops} hop{'s' if hops != 1 else ''}"
+        if attempt:
+            route += ", retry"
+        self.enqueue(text, packet=packet, label=f"dm:{sub['name']}", cmd=cmd, jitter=False,
+                     dm=dm, route=route)
+
+    def ack_timeout(self, packet_len: int, hops) -> float:
+        """Seconds to wait for an ACK; hops=None means the message was flooded."""
+        if self.args.ack_timeout > 0:
+            return self.args.ack_timeout
+        air = lora_airtime(packet_len, self.args.sf, self.args.bw * 1000, self.args.cr)
+        if hops is None:
+            return ACK_BASE + ACK_FLOOD_FACTOR * air
+        return ACK_BASE + (ACK_DIRECT_HOP_FACTOR * air + ACK_DIRECT_HOP_EXTRA) * (hops + 1)
+
+    async def ack_monitor(self):
+        """Direct messages whose ACK doesn't arrive in time go to dm_unacked."""
+        while True:
+            await asyncio.sleep(0.1)
+            now = time.monotonic()
+            for ack, dm in list(self.pending_acks.items()):
+                if dm["deadline"] is not None and now >= dm["deadline"] and self.pending_acks.pop(ack, None):
+                    self.expired_acks[ack] = (dm["sub"]["name"], dm["row"])
+                    while len(self.expired_acks) > 64:
+                        self.expired_acks.popitem(last=False)
+                    await self.dm_unacked(dm)
+
+    async def dm_unacked(self, dm):
+        """No ACK. Like the MeshCore companion clients: a direct route that
+        went unanswered is presumed broken, so forget it and resend once by
+        flood. The recipient answers a flood with a PATH packet carrying a
+        fresh route (and the ACK); until one arrives or they next speak in
+        the channel, heartbeats are flooded. A flood that goes unanswered
+        is not retried."""
+        sub, name = dm["sub"], dm["sub"]["name"]
+        if dm["status"] == "sent":
+            self.db.set_status(dm["row"], "no_ack")
+        if dm["hops"] is None:
+            log.warning("no ACK from %s for flooded message either; they may be out of range", name)
+            return
+        current = self.db.get_sub(name)
+        self.route_shared.pop(name, None)  # the route we gave them may be stale too: re-share
+        # don't throw away a route that was refreshed after this message went out
+        if current is not None and (current["path"], current["plb"]) == (sub["path"], sub["plb"]):
+            self.db.refresh_sub_path(name, b"", -1)
+        if current is None and dm["cmd"] != "heartbeat_end":
+            return  # heartbeats were turned off in the meantime
+        if self.tx_queue.qsize() >= MAX_QUEUED_TX:
+            log.warning("no ACK from %s via direct route; TX queue full, not retrying", name)
+            return
+        log.info("no ACK from %s via direct route; retrying by flood", name)
+        await self.send_direct(sub, dm["text"], dm["cmd"], ts=dm["ts"], attempt=dm["attempt"] + 1, flood=True)
 
     async def heartbeat(self):
         """Every --heartbeat-interval seconds, send a direct heartbeat to each
@@ -868,6 +1087,7 @@ class Bot:
         self.ser = serial.Serial(a.serial, baudrate=a.baud, timeout=0.2)
         self.decoder = KissDecoder()
         self.secrets.clear()
+        self.pending_acks.clear()
         self.hw_waiter = None
         log.info("opened serial %s @ %d baud", a.serial, a.baud)
 
@@ -884,6 +1104,7 @@ class Bot:
             tasks = [asyncio.create_task(self.serial_reader()),
                      asyncio.create_task(self.tx_worker()),
                      asyncio.create_task(self.heartbeat()),
+                     asyncio.create_task(self.ack_monitor()),
                      asyncio.create_task(self.advert_task())]
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -951,6 +1172,9 @@ def main():
                    help="how long one !heartbeaton lasts before it must be renewed (default 24)")
     p.add_argument("--max-heartbeat-subs", type=int, default=5,
                    help="max users with heartbeats on at once, to protect airtime (default 5)")
+    p.add_argument("--ack-timeout", type=float, default=0.0,
+                   help="seconds to wait for a direct message's ACK before retrying by flood; "
+                        "0 = estimate from packet airtime like the companion firmware (default 0)")
     p.add_argument("--advert-interval", type=float, default=12.0,
                    help="hours between the bot's own adverts; 0 = only at startup and on demand (default 12)")
     args = p.parse_args()

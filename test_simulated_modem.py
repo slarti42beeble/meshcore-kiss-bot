@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+End-to-end test of meshcore_kiss_bot.py against a SIMULATED KISS modem.
+
+No radio needed. A fake `serial` module stands in for the modem: it answers
+the SetHardware requests (radio config, identity, signing, key exchange),
+acknowledges transmissions with TxDone, and lets the test inject received
+packets (each followed by an RxMeta frame, as the real modem does).
+
+What it proves: the bot's KISS framing, packet parsing, channel crypto, advert
+signing/verification, direct-message building, heartbeat lifecycle and slot cap
+are internally consistent. What it does NOT prove: that real MeshCore firmware
+agrees with the packet layouts. Run:  python3 test_simulated_modem.py
+"""
+
+import argparse
+import asyncio
+import hashlib
+import hmac
+import os
+import struct
+import sys
+import threading
+import time
+import types
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # noqa: E402
+
+import meshcore_kiss_bot as m  # noqa: E402
+
+
+def raw_pub(key):
+    return key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+
+
+class FakeModem:
+    """Stands in for serial.Serial."""
+    port = "fake"
+    inst = None
+
+    def __init__(self, *a, **k):
+        self.out = bytearray()
+        self.lock = threading.Lock()
+        self.dec = m.KissDecoder()
+        self.key = Ed25519PrivateKey.generate()
+        self.pub = raw_pub(self.key)
+        self.sent = []                      # raw MeshCore packets the bot transmitted
+        self.on_tx = None                   # callback(packet): other radios reacting to it
+        FakeModem.inst = self
+
+    def _feed(self, frame):
+        with self.lock:
+            self.out += frame
+
+    def inject(self, packet, snr=6.0, rssi=-90):
+        """Deliver a received packet, followed by its RxMeta frame."""
+        self._feed(m.kiss_encode(0, packet))
+        self._feed(m.kiss_encode(6, bytes([0xF9, int(snr * 4) & 0xFF, rssi & 0xFF])))
+
+    def read(self, n):
+        with self.lock:
+            if self.out:
+                data = bytes(self.out[:n])
+                del self.out[:n]
+                return data
+        time.sleep(0.02)
+        return b""
+
+    def write(self, data):
+        for type_byte, p in self.dec.feed(data):
+            cmd = type_byte & 0x0F
+            if cmd == 0:                                    # packet to transmit
+                self.sent.append(p)
+                self._feed(m.kiss_encode(6, bytes([0xF8, 1])))   # TxDone, success
+                if self.on_tx:
+                    self.on_tx(p)
+            elif cmd == 6:                                  # SetHardware request
+                sub, body = p[0], p[1:]
+                resp = {
+                    0x09: bytes([0xF0]),                                            # SetRadio -> OK
+                    0x0A: bytes([0xF0]),                                            # SetTxPower -> OK
+                    0x0B: bytes([0x8B]) + struct.pack("<IIBB", 910525000, 62500, 7, 5),
+                    0x01: bytes([0x81]) + self.pub,                                 # identity
+                    0x04: bytes([0x84]) + self.key.sign(body),                      # signature
+                    0x07: bytes([0x87]) + hashlib.sha256(body).digest(),            # "shared secret"
+                }[sub]
+                self._feed(m.kiss_encode(6, resp))
+
+    def close(self):
+        pass
+
+
+fake_serial = types.ModuleType("serial")
+fake_serial.Serial = FakeModem
+sys.modules["serial"] = fake_serial
+
+
+# ---- helpers that play the part of other people's radios ----
+
+chan = m.Channel("#bot")
+_ts = [int(time.time())]
+
+
+def chan_pkt(text, path=b""):
+    """A flood group-text packet as heard from another node (unique timestamp
+    each time, or the bot's dedupe would drop repeats of the same text)."""
+    _ts[0] += 1
+    raw = struct.pack("<IB", _ts[0], 0) + text.encode()
+    mac, ct = m.encrypt_then_mac(chan._key32, raw)
+    return bytes([(m.PAYLOAD_GRP_TXT << 2) | m.ROUTE_FLOOD, len(path)]) + path + bytes([chan.hash]) + mac + ct
+
+
+def make_advert(key, name):
+    pub = raw_pub(key)
+    ts = struct.pack("<I", int(time.time()))
+    app = bytes([0x80 | m.ADV_TYPE_CHAT]) + name.encode()
+    return m.build_advert(pub, key.sign(pub + ts + app), ts, app)
+
+
+def channel_replies(modem):
+    return [chan.decrypt(m.parse_packet(s)["payload"])[2]
+            for s in modem.sent if m.parse_packet(s)["ptype"] == m.PAYLOAD_GRP_TXT]
+
+
+def open_dm(packet, secret):
+    """Decrypt a text message the bot sent (direct or flood); returns
+    (parsed, dest_hash, src_hash, body) where body = ts | flags | text."""
+    p = m.parse_packet(packet)
+    pl = p["payload"]
+    assert p["ptype"] == m.PAYLOAD_TXT_MSG
+    mac, ct = pl[2:4], pl[4:]
+    assert hmac.compare_digest(mac, hmac.new(secret, ct, hashlib.sha256).digest()[:2]), "bad MAC"
+    pt = Cipher(algorithms.AES(secret[:16]), modes.ECB()).decryptor().update(ct)
+    return p, pl[0], pl[1], pt[:5] + pt[5:].split(b"\0", 1)[0]
+
+
+def decode_dm(packet, secret):
+    """Decrypt a DIRECT message the bot sent; returns (parsed, dest_hash, src_hash, text)."""
+    p, dest, src, body = open_dm(packet, secret)
+    assert p["route"] == m.ROUTE_DIRECT
+    return p, dest, src, body[5:].decode()
+
+
+def dms_in(modem, start, secret):
+    """(parsed, attempt, text) for each text message the bot sent since modem.sent[start]."""
+    out = []
+    for s in modem.sent[start:]:
+        if m.parse_packet(s)["ptype"] == m.PAYLOAD_TXT_MSG:
+            p, _, _, body = open_dm(s, secret)
+            out.append((p, body[4] & 3, body[5:].decode()))
+    return out
+
+
+class RemoteNode:
+    """Plays a user's node answering the bot's text messages as MeshCore
+    firmware does: a direct message gets a plain ACK; a flood gets a PATH
+    packet carrying the route the flood took to reach it, plus the ACK."""
+
+    def __init__(self, modem, pub, secret, route_from_bot):
+        self.modem, self.pub, self.secret = modem, pub, secret
+        self.route_from_bot = route_from_bot   # path a flood from the bot takes to get here
+        self.reachable = True
+        self.dead_paths = set()                # direct routes that no longer get through
+        self.route_to_bot = None               # learned from the bot's PATH packets
+        self.ack_routes = []                   # route type of each ACK she sent
+
+    def __call__(self, packet):
+        p = m.parse_packet(packet)
+        if p["ptype"] not in (m.PAYLOAD_TXT_MSG, m.PAYLOAD_PATH) or p["payload"][0] != self.pub[0]:
+            return
+        flood = p["route"] == m.ROUTE_FLOOD
+        if not self.reachable or (not flood and p["path"] in self.dead_paths):
+            return
+        if p["ptype"] == m.PAYLOAD_PATH:   # the bot telling her how to reach it
+            pl = p["payload"]
+            path, plb, extra_type, _ = m.parse_path_return(m.mac_then_decrypt(self.secret, pl[2:4], pl[4:]))
+            self.route_to_bot = path
+            return
+        body = open_dm(packet, self.secret)[3]
+        ack = hashlib.sha256(body + self.modem.pub).digest()[:4]
+        if flood:
+            data = bytes([len(self.route_from_bot)]) + self.route_from_bot + bytes([m.PAYLOAD_ACK]) + ack
+            mac, ct = m.encrypt_then_mac(self.secret, data)
+            reply = (bytes([(m.PAYLOAD_PATH << 2) | m.ROUTE_FLOOD, 0, self.modem.pub[0], self.pub[0]])
+                     + mac + ct)
+        elif self.route_to_bot is not None:
+            # direct: each repeater strips its hash, so it arrives with an empty path
+            reply = bytes([(m.PAYLOAD_ACK << 2) | m.ROUTE_DIRECT, 0]) + ack
+        else:
+            reply = bytes([(m.PAYLOAD_ACK << 2) | m.ROUTE_FLOOD, 0]) + ack
+        self.ack_routes.append(m.parse_packet(reply)["route"])
+        self.modem.inject(reply)
+
+
+def check(cond, label):
+    print(("PASS  " if cond else "FAIL  ") + label)
+    if not cond:
+        raise AssertionError(label)
+
+
+async def main():
+    alice_key = Ed25519PrivateKey.generate()
+    alice_pub = raw_pub(alice_key)
+    alice_secret = hashlib.sha256(alice_pub).digest()   # what FakeModem's key exchange returns
+
+    args = argparse.Namespace(
+        serial="x", baud=1, channel="#bot", name="MeshBot", freq=910.525, bw=62.5, sf=7, cr=5, power=22,
+        cooldown=0, max_replies_per_min=100, delay_min=0, delay_max=0,
+        heartbeat_interval=0.5, heartbeat_hours=2.2 / 3600,   # 2.2 s "24 hours" so expiry is testable
+        max_heartbeat_subs=1, advert_interval=0, ack_timeout=0.15)
+    db = m.BotDB(":memory:")
+    bot = m.Bot(args, db)
+    run = asyncio.create_task(bot.run_once())
+    await asyncio.sleep(0.5)
+    modem = FakeModem.inst
+    alice = RemoteNode(modem, alice_pub, alice_secret, route_from_bot=b"\x55\x66")
+    modem.on_tx = alice
+    await asyncio.sleep(3.2)        # the bot's startup advert fires 3 s after connect
+
+    # --- startup advert is signed correctly and verifies
+    adverts = [s for s in modem.sent if m.parse_packet(s)["ptype"] == m.PAYLOAD_ADVERT]
+    check(bool(adverts), "bot broadcast an advert at startup")
+    pub, adv_type, name = m.parse_advert(m.parse_packet(adverts[0])["payload"])
+    check((pub, adv_type, name) == (modem.pub, m.ADV_TYPE_CHAT, "MeshBot"), "bot advert verifies and carries its name")
+
+    # --- channel command: !ping
+    modem.inject(chan_pkt("Carol: !ping", b"\x44"))
+    await asyncio.sleep(0.4)
+    ping = [r for r in channel_replies(modem) if "pong" in r]
+    check(bool(ping) and "@Carol" in ping[-1] and "1 hop" in ping[-1], f"!ping answered with hop count ({ping[-1] if ping else None})")
+
+    # --- same packet arriving twice is processed once
+    dup = chan_pkt("Carol: !time")
+    modem.inject(dup)
+    modem.inject(dup)
+    await asyncio.sleep(0.4)
+    check(sum(1 for s in db.db.execute("SELECT 1 FROM messages WHERE command='!time' AND direction='rx'")) == 1,
+          "duplicate packet logged and answered once")
+
+    # --- !heartbeaton before any advert has been heard
+    modem.inject(chan_pkt("Alice: !heartbeaton", b"\x11\x22"))
+    await asyncio.sleep(0.4)
+    check(db.get_sub("Alice") is None and "haven't heard an advert" in channel_replies(modem)[-1],
+          "!heartbeaton without a known key is refused and asks for an advert")
+
+    # --- Alice's advert is heard, then she enables heartbeats
+    modem.inject(make_advert(alice_key, "Alice"))
+    await asyncio.sleep(0.2)
+    check(db.keys_for_name("Alice") == [alice_pub], "advert from Alice stored (name -> public key)")
+    modem.inject(chan_pkt("Alice: !heartbeaton", b"\x11\x22"))
+    await asyncio.sleep(0.4)
+    sub = db.get_sub("Alice")
+    check(sub is not None and bytes.fromhex(sub["pubkey"]) == alice_pub, "subscription created")
+
+    # --- heartbeat is DIRECT, along the reversed path, decryptable by Alice
+    n0 = len(modem.sent)
+    await asyncio.sleep(0.8)
+    dms = [s for s in modem.sent[n0:] if m.parse_packet(s)["ptype"] == m.PAYLOAD_TXT_MSG]
+    check(bool(dms), "heartbeat sent as a direct message (not a channel post)")
+    p, dest, src, text = decode_dm(dms[0], alice_secret)
+    check(p["path"] == b"\x22\x11", "direct route follows the reverse of the inbound path")
+    check(dest == alice_pub[0] and src == modem.pub[0], "destination and source hashes correct")
+    check(text.startswith("heartbeat "), f"heartbeat text decrypts for the recipient ({text!r})")
+
+    # --- reciprocal path: before the first heartbeat she's told the route to the bot, so ACKs come back direct
+    paths = [s for s in modem.sent if m.parse_packet(s)["ptype"] == m.PAYLOAD_PATH]
+    check(bool(paths) and m.parse_packet(paths[0])["route"] == m.ROUTE_DIRECT
+          and modem.sent.index(paths[0]) < modem.sent.index(dms[0]),
+          "bot sends her a direct PATH packet ahead of the first heartbeat")
+    check(alice.route_to_bot == b"\x11\x22", "PATH tells her the route her own message took to the bot")
+    check(alice.ack_routes and set(alice.ack_routes) == {m.ROUTE_DIRECT}, "her ACKs come back direct, not flooded")
+    check(len(paths) == 1, "route is shared once, not with every heartbeat")
+
+    # --- ACK handling (keep the sub alive for these; it normally lasts 2.2 s here)
+    db.db.execute("UPDATE hb_subs SET expires_at=?", (time.time() + 60,))
+    await asyncio.sleep(0.3)
+    check(db.db.execute("SELECT COUNT(*) FROM messages WHERE command='heartbeat' AND status='acked'").fetchone()[0] > 0
+          and not db.db.execute("SELECT 1 FROM messages WHERE status='no_ack'").fetchall(),
+          "ACKed direct heartbeats are marked acked, nothing falls back to flood")
+
+    # --- a repeater on her route disappears: no ACK -> flood retry -> PATH return gives a new route
+    alice.dead_paths.add(b"\x22\x11")
+    n = len(modem.sent)
+    await asyncio.sleep(1.3)
+    sent = dms_in(modem, n, alice_secret)
+    lost = [t for p, a, t in sent if p["route"] == m.ROUTE_DIRECT and p["path"] == b"\x22\x11"]
+    retries = [t for p, a, t in sent if p["route"] == m.ROUTE_FLOOD and a == 1]
+    check(bool(lost) and retries and retries[0] == lost[0],
+          "unACKed direct heartbeat is resent by flood (same text, attempt 1)")
+    check(db.get_sub("Alice")["path"] == "6655" and sent[-1][0]["path"] == b"\x55\x66"
+          and sent[-1][0]["route"] == m.ROUTE_DIRECT,
+          "route learned from the PATH reply; later heartbeats go direct along it")
+    check(alice.route_to_bot == b"\x66\x55", "new route back to the bot shared with her")
+    check(db.db.execute("SELECT COUNT(*) FROM messages WHERE command='heartbeat' AND path='5566' "
+                        "AND status='acked'").fetchone()[0] > 0,
+          "heartbeats on the new route are ACKed")
+
+    # --- she goes out of range completely: route forgotten, heartbeats flood, no endless retries
+    alice.reachable = False
+    n = len(modem.sent)
+    await asyncio.sleep(1.3)
+    sent = dms_in(modem, n, alice_secret)
+    check(db.get_sub("Alice")["plb"] == -1, "unreachable user: stored route reset")
+    check(sum(1 for p, a, t in sent if p["route"] == m.ROUTE_DIRECT) == 1
+          and sent[-1][0]["route"] == m.ROUTE_FLOOD and sent[-1][1] == 0
+          and sum(1 for p, a, t in sent if a == 1) == 1,
+          "after the failed retry, heartbeats are flooded and a failed flood is not retried")
+
+    # --- back in range: the next flooded heartbeat's PATH reply restores a direct route
+    alice.reachable = True
+    await asyncio.sleep(1.0)
+    check(db.get_sub("Alice")["plb"] == 2 and dms_in(modem, n, alice_secret)[-1][0]["route"] == m.ROUTE_DIRECT,
+          "back in range: route relearned, direct heartbeats resume")
+
+    # --- path refresh when she speaks again by a different route
+    modem.inject(chan_pkt("Alice: hi", b"\x33"))
+    await asyncio.sleep(0.2)
+    check(bytes.fromhex(db.get_sub("Alice")["path"]) == b"\x33", "stored path refreshed from her latest message")
+
+    # --- status, then off stops DMs
+    modem.inject(chan_pkt("Alice: !heartbeat"))
+    await asyncio.sleep(0.3)
+    check("ON" in channel_replies(modem)[-1], "!heartbeat reports ON")
+    modem.inject(chan_pkt("Alice: !heartbeatoff"))
+    await asyncio.sleep(0.3)
+    n1 = len(modem.sent)
+    await asyncio.sleep(1.2)
+    check(db.get_sub("Alice") is None and not [s for s in modem.sent[n1:] if m.parse_packet(s)["ptype"] == m.PAYLOAD_TXT_MSG],
+          "!heartbeatoff removes the subscription and stops direct messages")
+
+    # --- renewal expires: final notice, then subscription removed
+    modem.inject(chan_pkt("Alice: !heartbeaton", b"\x11"))
+    await asyncio.sleep(0.3)
+    n2 = len(modem.sent)
+    await asyncio.sleep(3.2)
+    texts = [decode_dm(s, alice_secret)[3] for s in modem.sent[n2:] if m.parse_packet(s)["ptype"] == m.PAYLOAD_TXT_MSG]
+    check(len(texts) >= 2 and texts[-1].startswith("heartbeats ended") and db.get_sub("Alice") is None,
+          f"subscription expires with a final direct notice ({len(texts)} DMs, last: {texts[-1][:30] if texts else None!r}...)")
+
+    # --- slot cap: with 1 slot used, a second user is refused
+    modem.inject(chan_pkt("Alice: !heartbeaton", b"\x11"))
+    await asyncio.sleep(0.3)
+    bob_key = Ed25519PrivateKey.generate()
+    modem.inject(make_advert(bob_key, "Bob"))
+    await asyncio.sleep(0.2)
+    modem.inject(chan_pkt("Bob: !heartbeaton"))
+    await asyncio.sleep(0.3)
+    check(db.get_sub("Bob") is None and "slots" in channel_replies(modem)[-1], "slot cap (--max-heartbeat-subs) enforced")
+
+    # --- tampered advert is rejected
+    bad = bytearray(make_advert(Ed25519PrivateKey.generate(), "Mallory"))
+    bad[-1] ^= 1
+    modem.inject(bytes(bad))
+    await asyncio.sleep(0.2)
+    check(not db.keys_for_name("Mallory"), "advert with a bad signature is ignored")
+
+    # --- other channel's traffic is ignored
+    other = m.Channel("#other")
+    modem.inject(bytes([(m.PAYLOAD_GRP_TXT << 2) | m.ROUTE_FLOOD, 0]) + other.encrypt("Eve: !ping"))
+    await asyncio.sleep(0.2)
+    check(not db.db.execute("SELECT 1 FROM messages WHERE sender='Eve'").fetchall(), "messages for a different channel are ignored")
+
+    # --- everything was logged
+    rx, senders, tx = db.summary()
+    check(rx > 0 and tx > 0, f"message log populated (rx={rx}, senders={senders}, tx={tx})")
+
+    run.cancel()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    print("\nALL TESTS PASSED")
