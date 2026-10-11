@@ -170,6 +170,21 @@ class RemoteNode:
         self.route_to_bot = None               # learned from the bot's PATH packets
         self.ack_routes = []                   # route type of each ACK she sent
         self.acks_received = []                # (ack, route type) of ACKs the bot sent her
+        self.responses = []                    # (data, route type, PATH route or None) of RESPONSEs to her
+
+    def send_req(self, tag, inv_mask=0xFE, path=b"", direct=False):
+        """Her app's telemetry request, as the companion firmware builds it
+        for "path discovery": AES(tag | 0x03 | inverse permission mask
+        (0xFE = base telemetry only) | 3 reserved | 4 random)."""
+        data = struct.pack("<I", tag) + bytes([0x03, inv_mask, 0, 0, 0]) + os.urandom(4)
+        mac, ct = m.encrypt_then_mac(self.secret, data)
+        payload = bytes([self.modem.pub[0], self.pub[0]]) + mac + ct
+        if direct:
+            pkt = bytes([(m.PAYLOAD_REQ << 2) | m.ROUTE_DIRECT, 0]) + payload
+        else:   # transport-flood with region codes, as her real app sends it
+            pkt = bytes([(m.PAYLOAD_REQ << 2) | m.ROUTE_TRANSPORT_FLOOD]) + b"\xe1\x23\x00\x00" \
+                + bytes([len(path)]) + path + payload
+        self.modem.inject(pkt)
 
     def send_dm(self, text, ts, attempt=0, path=b"", direct=False):
         """She sends the bot a direct message: flooded (arriving with `path`)
@@ -189,7 +204,7 @@ class RemoteNode:
             if self.reachable:
                 self.acks_received.append((p["payload"][:4], p["route"]))
             return
-        if p["ptype"] not in (m.PAYLOAD_TXT_MSG, m.PAYLOAD_PATH) or p["payload"][0] != self.pub[0]:
+        if p["ptype"] not in (m.PAYLOAD_TXT_MSG, m.PAYLOAD_PATH, m.PAYLOAD_RESPONSE) or p["payload"][0] != self.pub[0]:
             return
         flood = p["route"] == m.ROUTE_FLOOD
         if not self.reachable or (not flood and p["path"] in self.dead_paths):
@@ -200,6 +215,12 @@ class RemoteNode:
             self.route_to_bot = path
             if extra_type == m.PAYLOAD_ACK:
                 self.acks_received.append((extra[:4], p["route"]))
+            elif extra_type == m.PAYLOAD_RESPONSE:
+                self.responses.append((extra, p["route"], path))
+            return
+        if p["ptype"] == m.PAYLOAD_RESPONSE:
+            pl = p["payload"]
+            self.responses.append((m.mac_then_decrypt(self.secret, pl[2:4], pl[4:]), p["route"], None))
             return
         body = open_dm(packet, self.secret)[3]
         ack = hashlib.sha256(body + self.modem.pub).digest()[:4]
@@ -215,6 +236,17 @@ class RemoteNode:
             reply = bytes([(m.PAYLOAD_ACK << 2) | m.ROUTE_FLOOD, 0]) + ack
         self.ack_routes.append(m.parse_packet(reply)["route"])
         self.modem.inject(reply)
+
+
+def decode_lpp(buf):
+    """Minimal CayenneLPP reader for the types the bot sends: {(channel, type): value}."""
+    sizes = {116: 2, 120: 1, 100: 4}
+    out, i = {}, 0
+    while i + 2 <= len(buf) and buf[i + 1] in sizes:
+        ch, t, n = buf[i], buf[i + 1], sizes[buf[i + 1]]
+        out[(ch, t)] = int.from_bytes(buf[i + 2:i + 2 + n], "big")
+        i += 2 + n
+    return out
 
 
 def check(cond, label):
@@ -447,10 +479,43 @@ async def main():
     check(len(modem.sent) == n and db.db.execute("SELECT COUNT(*) FROM messages WHERE direction='rx'").fetchone()[0] == rows,
           "DM from a node whose advert was never heard is ignored")
 
+    # --- telemetry: a companion app's "path discovery" (flooded telemetry request)
+    await asyncio.sleep(0.2)
+    n = len(modem.sent)
+    alice.route_to_bot = None
+    alice.send_req(0x12345678, path=b"\x99")
+    await asyncio.sleep(0.5)
+    paths = [r for r in alice.responses if r[1] == m.ROUTE_FLOOD and r[2] is not None]
+    check(paths and paths[-1][2] == b"\x99" and alice.route_to_bot == b"\x99",
+          "path discovery answered with a flooded PATH carrying the route the request took")
+    data = paths[-1][0] if paths else b""
+    lpp = decode_lpp(data[4:])
+    check(data[:4] == struct.pack("<I", 0x12345678), "response echoes the request's tag (how the app matches it)")
+    check(lpp.get((1, 120)) == 100 and lpp.get((1, 116)) == 420
+          and abs(lpp.get((2, 100), -99) - (time.time() - bot.start)) < 5,
+          f"telemetry: battery 100% / 4.20V on channel 1, bot uptime on channel 2 ({lpp})")
+    check(db.db.execute("SELECT 1 FROM messages WHERE direction='rx' AND channel='dm:Alice' "
+                        "AND command='telemetry'").fetchone() is not None
+          and db.db.execute("SELECT 1 FROM messages WHERE direction='tx' AND channel='dm:Alice' "
+                            "AND command='telemetry'").fetchone() is not None,
+          "telemetry request and answer logged")
+
+    before = len(alice.responses)
+    alice.send_req(0x2222, direct=True)
+    await asyncio.sleep(0.5)
+    direct_resp = [r for r in alice.responses[before:] if r[2] is None]
+    check(direct_resp and direct_resp[0][1] == m.ROUTE_DIRECT and direct_resp[0][0][:4] == struct.pack("<I", 0x2222),
+          "telemetry request that arrived direct is answered with a direct RESPONSE")
+
+    before = len(alice.responses)
+    alice.send_req(0x3333, inv_mask=0xFF, path=b"\x99")   # asks for no base telemetry
+    await asyncio.sleep(0.5)
+    check(len(alice.responses) == before, "request that excludes base telemetry gets no answer")
+
     alice.send_dm("heartbeaton", ts + 2, direct=True)
     await asyncio.sleep(0.5)
     sub = db.get_sub("Alice")
-    check(sub is not None and bytes.fromhex(sub["pubkey"]) == alice_pub and sub["path"] == "77",
+    check(sub is not None and bytes.fromhex(sub["pubkey"]) == alice_pub and sub["path"] == "99",   # learned from the path discovery above
           "!heartbeaton by DM subscribes her with her proven key and known route")
     db.remove_sub("Alice")
 
