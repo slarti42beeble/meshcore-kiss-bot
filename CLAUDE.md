@@ -23,11 +23,21 @@ logged before this change have UTC `iso` values ending in `Z`.
 
 ## Status — read this first
 
-- **Never run against real hardware.** The author's own tests are the simulated-modem test, which
-  only proves the code is self-consistent, not that real firmware agrees with it.
-- The packet layouts below were written from the MeshCore docs and recollection. If something
-  fails on a real radio, suspect the layouts first (run with `-v` and compare raw hex).
-- Heartbeats (direct messages) are the riskiest part; channel commands are the simplest.
+- **Running on real hardware since 2026-10.** The owner runs it on Windows with a KISS-modem node
+  on a live mesh that uses region transport codes (TRANSPORT_FLOOD from companion apps) and
+  3-byte path hashes. Confirmed working there (2026-10-10, from `-v` logs and the live database):
+  - radio config, identity and signed adverts (repeaters re-flood them);
+  - hashtag channel commands and replies;
+  - direct heartbeats to subscribers, ACKed by their nodes (`status='acked'`);
+  - DMs to the bot: received, decrypted, ACKed (the sender's app marks them delivered), and the
+    bot's replies ACKed by the sender; reciprocal PATH packets sent.
+- **Not yet seen on air:** the no-ACK path (flood fallback, route learning from PATH replies,
+  flood backoff). There has been no `no_ack` row yet, so these are proven only by the
+  simulated-modem test, which shows the code is self-consistent, not that firmware agrees.
+- Packet layouts were written from the MeshCore docs and recollection. If something fails on a
+  real radio, suspect the layouts first (run with `-v` and compare raw hex).
+- The owner runs a *copy* of the script from another folder. If a real-radio bug looks like
+  missing code, first check that copy matches `main`.
 
 ## Architecture (all in `meshcore_kiss_bot.py`)
 
