@@ -98,8 +98,11 @@ logged before this change have UTC `iso` values ending in `Z`.
 
 - Channel sender names are **not authenticated**: anyone can enable heartbeats under another
   user's name. If two nodes advertise the same name the bot refuses.
-- A user who stays out of range gets a **flooded** heartbeat every interval (mesh-wide airtime)
-  until they return or their 24 h runs out; no backoff yet.
+- **Flood backoff**: while a user has no known route and floods go unACKed, flooded heartbeats
+  wait 2x, 4x, 8x... the interval (`flood_delay`), capped at `--flood-backoff-max` minutes
+  (default 30). Reset by any ACK from them, a channel message, `!heartbeaton` or `!heartbeatoff`.
+  Kept in memory (`flood_backoff`), so a restart starts the backoff over. The expiry notice is
+  not held back.
 - Reciprocal path: before the first direct message on a route (and again whenever that route
   changes or a DM goes unACKed), the bot sends the user a direct PATH packet giving the route
   to itself (the stored from-them-to-us path), so their ACKs come back direct instead of

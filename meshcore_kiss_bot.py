@@ -41,7 +41,9 @@ path is gone), the bot does what MeshCore companion clients do: it forgets
 that route and resends the message once by FLOOD. The recipient answers a
 flood with a PATH packet carrying the ACK and the route the flood took, which
 becomes the new direct route. Until a route is learned again (or the user
-next speaks in the channel), heartbeats are flooded. The bot also sends each
+next speaks in the channel), heartbeats are flooded, backing off (2x, 4x, 8x...
+the interval, up to --flood-backoff-max minutes) while floods go unanswered,
+since each flood costs airtime across the whole mesh. The bot also sends each
 user's node a PATH packet with the route back to the bot, so their ACKs come
 back direct instead of being flooded. --ack-timeout overrides
 the airtime-based ACK wait.
@@ -614,6 +616,7 @@ class Bot:
         self.pending_acks = {}             # expected ACK -> direct message awaiting it
         self.expired_acks = OrderedDict()  # ACKs we gave up on: ack -> (name, tx row id)
         self.route_shared = {}             # name -> (path hex, plb) we last told them reaches us
+        self.flood_backoff = {}            # name -> (unACKed floods in a row, monotonic time of next flood)
 
         # command table: "!cmd" -> handler(ctx) -> reply text
         self.commands = {
@@ -655,11 +658,13 @@ class Bot:
         hours = self.args.heartbeat_hours
         renewing = self.db.get_sub(name) is not None
         self.db.upsert_sub(name, keys[0], c["path"], c["plb"], now + hours * 3600)
+        self.flood_backoff.pop(name, None)
         self.advert_now.set()  # make sure they can find/add the bot as a contact
         return (f"@{name} heartbeat {'renewed' if renewing else 'ON'} for {hours:g}h: direct msgs every "
                 f"{self.args.heartbeat_interval:g}s. Add me as a contact. !heartbeatoff to stop")
 
     def cmd_heartbeat_off(self, c):
+        self.flood_backoff.pop(c["sender"], None)
         if self.db.remove_sub(c["sender"]):
             return f"@{c['sender']} heartbeat OFF"
         return f"@{c['sender']} heartbeat wasn't on"
@@ -740,6 +745,8 @@ class Bot:
             return  # otherwise: someone else's ACK, or a duplicate copy
         if dm["row"] is not None:
             self.db.set_status(dm["row"], "acked")
+        if self.flood_backoff.pop(dm["sub"]["name"], None):
+            log.info("%s is reachable again; flood backoff reset", dm["sub"]["name"])
         log.info("ACK from %s (%s)", dm["sub"]["name"], "flood" if dm["hops"] is None else "direct")
 
     def handle_path(self, payload: bytes):
@@ -809,6 +816,7 @@ class Bot:
         # route back to them, so heartbeats follow it in reverse.
         if sender:
             self.db.refresh_sub_path(sender, pkt["path"], pkt["plb"])
+            self.flood_backoff.pop(sender, None)
 
         cmd, _, args = msg.partition(" ")
         cmd = cmd.lower()
@@ -1005,12 +1013,16 @@ class Bot:
         flood. The recipient answers a flood with a PATH packet carrying a
         fresh route (and the ACK); until one arrives or they next speak in
         the channel, heartbeats are flooded. A flood that goes unanswered
-        is not retried."""
+        is not retried; instead flooded heartbeats back off (flood_delay)."""
         sub, name = dm["sub"], dm["sub"]["name"]
         if dm["status"] == "sent":
             self.db.set_status(dm["row"], "no_ack")
         if dm["hops"] is None:
-            log.warning("no ACK from %s for flooded message either; they may be out of range", name)
+            misses = self.flood_backoff.get(name, (0, 0))[0] + 1
+            delay = self.flood_delay(misses)
+            self.flood_backoff[name] = (misses, time.monotonic() + delay)
+            log.warning("no ACK from %s for flooded message either; they may be out of range. "
+                        "Next flooded heartbeat in %s", name, fmt_duration(delay))
             return
         current = self.db.get_sub(name)
         self.route_shared.pop(name, None)  # the route we gave them may be stale too: re-share
@@ -1024,6 +1036,13 @@ class Bot:
             return
         log.info("no ACK from %s via direct route; retrying by flood", name)
         await self.send_direct(sub, dm["text"], dm["cmd"], ts=dm["ts"], attempt=dm["attempt"] + 1, flood=True)
+
+    def flood_delay(self, misses: int) -> float:
+        """Seconds to hold off flooding someone after `misses` unACKed floods
+        in a row: 2, 4, 8... heartbeat intervals, capped at
+        --flood-backoff-max minutes. Each flood costs airtime across the
+        whole mesh, so an out-of-range user mustn't get one every interval."""
+        return min(self.args.heartbeat_interval * 2 ** misses, self.args.flood_backoff_max * 60)
 
     async def heartbeat(self):
         """Every --heartbeat-interval seconds, send a direct heartbeat to each
@@ -1052,6 +1071,8 @@ class Bot:
                 if self.tx_queue.qsize() >= MAX_QUEUED_TX:
                     log.warning("TX queue backed up; skipping remaining heartbeats this round")
                     break
+                if sub["plb"] < 0 and time.monotonic() < self.flood_backoff.get(sub["name"], (0, 0))[1]:
+                    continue  # no route, and recent floods went unanswered: backing off
                 left = fmt_duration(sub["expires_at"] - now)
                 await self.send_direct(sub, f"heartbeat {stamp} ({left} left)", "heartbeat")
 
@@ -1182,6 +1203,9 @@ def main():
     p.add_argument("--ack-timeout", type=float, default=0.0,
                    help="seconds to wait for a direct message's ACK before retrying by flood; "
                         "0 = estimate from packet airtime like the companion firmware (default 0)")
+    p.add_argument("--flood-backoff-max", type=float, default=30.0,
+                   help="when a subscriber is out of range, flooded heartbeats back off (2x, 4x, 8x... "
+                        "the interval) up to this many minutes apart (default 30)")
     p.add_argument("--advert-interval", type=float, default=12.0,
                    help="hours between the bot's own adverts; 0 = only at startup and on demand (default 12)")
     args = p.parse_args()

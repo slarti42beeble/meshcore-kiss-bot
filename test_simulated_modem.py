@@ -49,6 +49,7 @@ class FakeModem:
         self.key = Ed25519PrivateKey.generate()
         self.pub = raw_pub(self.key)
         self.sent = []                      # raw MeshCore packets the bot transmitted
+        self.sent_at = []                   # time.monotonic() of each
         self.on_tx = None                   # callback(packet): other radios reacting to it
         FakeModem.inst = self
 
@@ -75,6 +76,7 @@ class FakeModem:
             cmd = type_byte & 0x0F
             if cmd == 0:                                    # packet to transmit
                 self.sent.append(p)
+                self.sent_at.append(time.monotonic())
                 self._feed(m.kiss_encode(6, bytes([0xF8, 1])))   # TxDone, success
                 if self.on_tx:
                     self.on_tx(p)
@@ -211,7 +213,8 @@ async def main():
         serial="x", baud=1, channel="#bot", name="MeshBot", freq=910.525, bw=62.5, sf=7, cr=5, power=22,
         cooldown=0, max_replies_per_min=100, delay_min=0, delay_max=0,
         heartbeat_interval=0.5, heartbeat_hours=2.2 / 3600,   # 2.2 s "24 hours" so expiry is testable
-        max_heartbeat_subs=1, advert_interval=0, ack_timeout=0.15, timezone="America/Los_Angeles")
+        max_heartbeat_subs=1, advert_interval=0, ack_timeout=0.15, timezone="America/Los_Angeles",
+        flood_backoff_max=0.05)                               # 3 s cap so the backoff is testable
     db = m.BotDB(":memory:")
     bot = m.Bot(args, db)
     run = asyncio.create_task(bot.run_once())
@@ -304,19 +307,32 @@ async def main():
     # --- she goes out of range completely: route forgotten, heartbeats flood, no endless retries
     alice.reachable = False
     n = len(modem.sent)
-    await asyncio.sleep(1.3)
+    await asyncio.sleep(5.5)
     sent = dms_in(modem, n, alice_secret)
     check(db.get_sub("Alice")["plb"] == -1, "unreachable user: stored route reset")
     check(sum(1 for p, a, t in sent if p["route"] == m.ROUTE_DIRECT) == 1
-          and sent[-1][0]["route"] == m.ROUTE_FLOOD and sent[-1][1] == 0
           and sum(1 for p, a, t in sent if a == 1) == 1,
-          "after the failed retry, heartbeats are flooded and a failed flood is not retried")
+          "after the failed direct heartbeat, one flood retry, and a failed flood is not retried")
+    floods = [modem.sent_at[i] for i in range(n, len(modem.sent))
+              if m.parse_packet(modem.sent[i])["ptype"] == m.PAYLOAD_TXT_MSG
+              and m.parse_packet(modem.sent[i])["route"] == m.ROUTE_FLOOD]
+    gaps = [round(b - a, 2) for a, b in zip(floods, floods[1:])]
+    # interval 0.5 s: unanswered floods are followed by waits of 1 s, then 2 s (instead of every 0.5 s)
+    check(len(floods) == 3 and gaps[0] >= 1.0 and gaps[1] >= 2.0,
+          f"flooded heartbeats back off while unanswered (gaps between floods: {gaps} s)")
+    check([bot.flood_delay(k) for k in (1, 2, 3, 6)] == [1.0, 2.0, 3.0, 3.0],
+          "backoff doubles each time and stops at --flood-backoff-max")
 
     # --- back in range: the next flooded heartbeat's PATH reply restores a direct route
     alice.reachable = True
-    await asyncio.sleep(1.0)
-    check(db.get_sub("Alice")["plb"] == 2 and dms_in(modem, n, alice_secret)[-1][0]["route"] == m.ROUTE_DIRECT,
-          "back in range: route relearned, direct heartbeats resume")
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if db.get_sub("Alice")["plb"] == 2:
+            break
+    await asyncio.sleep(0.6)
+    check(db.get_sub("Alice")["plb"] == 2 and dms_in(modem, n, alice_secret)[-1][0]["route"] == m.ROUTE_DIRECT
+          and "Alice" not in bot.flood_backoff,
+          "back in range: route relearned, backoff reset, direct heartbeats resume")
 
     # --- path refresh when she speaks again by a different route
     modem.inject(chan_pkt("Alice: hi", b"\x33"))
