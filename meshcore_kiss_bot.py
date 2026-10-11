@@ -55,6 +55,11 @@ MeshCore firmware does, and the reply comes back as a direct message, with
 the same ACK tracking and flood fallback as heartbeats. A DM proves who sent
 it, unlike a name in the channel.
 
+TELEMETRY / PATH DISCOVERY: a companion app's "path discovery" is a flooded
+telemetry request. The bot answers it like a companion node: battery 100 %
+(4.20 V) and its uptime, sent back inside a PATH packet that carries the route
+the request took, which is what the app needs.
+
 MESSAGE LOGGING: every channel message heard, every message sent (channel
 replies, direct heartbeats and adverts) is written to a SQLite database
 (--db) with timestamp, sender, text, hop count, path, SNR/RSSI, the command
@@ -241,6 +246,8 @@ ROUTE_FLOOD = 1
 ROUTE_DIRECT = 2
 ROUTE_TRANSPORT_DIRECT = 3
 
+PAYLOAD_REQ = 0
+PAYLOAD_RESPONSE = 1
 PAYLOAD_TXT_MSG = 2
 PAYLOAD_ACK = 3
 PAYLOAD_ADVERT = 4
@@ -249,6 +256,14 @@ PAYLOAD_PATH = 8
 PAYLOAD_MULTIPART = 10
 
 ADV_TYPE_CHAT = 1
+
+# Requests (REQ payloads) and telemetry, as in the MeshCore companion firmware
+REQ_GET_TELEMETRY = 0x03
+TELEM_PERM_BASE = 0x01      # 'base' telemetry: the node's own battery
+TELEM_CHANNEL_SELF = 1      # CayenneLPP channel for the node itself
+LPP_GENERIC_SENSOR = 100    # 4 bytes, unsigned
+LPP_VOLTAGE = 116           # 2 bytes, 0.01 V
+LPP_PERCENTAGE = 120        # 1 byte, 1-100 %
 
 # Payload max is 184 bytes: 3 bytes channel hash+MAC, then AES blocks holding
 # 5 bytes (timestamp+flags) + text. 150 text bytes keeps us safely inside it.
@@ -390,6 +405,27 @@ def build_path_return(dest_pub: bytes, src_pub: bytes, secret32: bytes, route_to
         return bytes([(PAYLOAD_PATH << 2) | ROUTE_FLOOD, 0x00]) + payload
     header = (PAYLOAD_PATH << 2) | ROUTE_DIRECT
     return bytes([header, plb]) + reverse_path(path, plb) + payload
+
+
+def build_response(dest_pub: bytes, src_pub: bytes, secret32: bytes, data: bytes,
+                   path: bytes = None, plb: int = 0) -> bytes:
+    """A RESPONSE packet (answer to a REQ): dest hash | src hash | MAC |
+    AES(data). DIRECT back along the reverse of `path`, or flooded."""
+    mac, ct = encrypt_then_mac(secret32, data)
+    payload = bytes([dest_pub[0], src_pub[0]]) + mac + ct
+    if path is None:
+        return bytes([(PAYLOAD_RESPONSE << 2) | ROUTE_FLOOD, 0x00]) + payload
+    return bytes([(PAYLOAD_RESPONSE << 2) | ROUTE_DIRECT, plb]) + reverse_path(path, plb) + payload
+
+
+def lpp_telemetry(uptime_s: int) -> bytes:
+    """Minimal CayenneLPP telemetry (channel | type | big-endian value): the
+    bot has no battery, so report it full (100 %, and 4.20 V, which is what
+    the companion firmware itself sends), plus the bot's uptime in seconds as
+    a generic sensor on channel 2 (LPP has no uptime type)."""
+    return (bytes([TELEM_CHANNEL_SELF, LPP_VOLTAGE]) + struct.pack(">H", 420)
+            + bytes([TELEM_CHANNEL_SELF, LPP_PERCENTAGE, 100])
+            + bytes([2, LPP_GENERIC_SENSOR]) + struct.pack(">I", min(uptime_s, 0xFFFFFFFF)))
 
 
 def build_ack(ack: bytes, path: bytes = None, plb: int = 0) -> bytes:
@@ -826,14 +862,14 @@ class Bot:
         if pkt["ptype"] == PAYLOAD_PATH:
             self.handle_path(pkt["payload"])
             return
-        if pkt["ptype"] == PAYLOAD_TXT_MSG:
+        if pkt["ptype"] in (PAYLOAD_TXT_MSG, PAYLOAD_REQ):
             pl = pkt["payload"]
             if (len(pl) >= 4 + 16 and pl[0] == self.pubkey[0]
                     and not self.seen_before(hashlib.sha256(pl).digest())):
                 if self.dm_queue.qsize() < 16:
                     self.dm_queue.put_nowait((pkt, snr, rssi))  # decrypting needs the modem: dm_worker
                 else:
-                    log.warning("too many direct messages waiting; dropped one")
+                    log.warning("too many direct packets waiting; dropped one")
             return
         if pkt["ptype"] != PAYLOAD_GRP_TXT:
             return
@@ -878,23 +914,31 @@ class Bot:
         if reply is not None:
             self.enqueue(reply, reply_to=row_id, cmd=cmd)
 
-    def run_command(self, handler, cmd, ctx):
-        """Apply the airtime limits, then run a command. Returns the reply
-        text, or None if it was rate-limited or failed."""
-        sender, now = ctx["sender"], time.time()
-        if now - self.last_reply.get(sender, 0) < self.args.cooldown:
+    def reply_allowed(self, sender, what, per_sender=True) -> bool:
+        """The airtime limits: per-sender cooldown (optional), global replies
+        per minute, TX queue cap. Counts the reply if allowed."""
+        now = time.time()
+        if per_sender and now - self.last_reply.get(sender, 0) < self.args.cooldown:
             log.info("rate-limited %s", sender)
-            return None
+            return False
         while self.reply_times and now - self.reply_times[0] > 60:
             self.reply_times.popleft()
         if len(self.reply_times) >= self.args.max_replies_per_min:
-            log.warning("global reply limit reached; ignoring %s from %s", cmd, sender)
-            return None
+            log.warning("global reply limit reached; ignoring %s from %s", what, sender)
+            return False
         if self.tx_queue.qsize() >= MAX_QUEUED_TX:
-            log.warning("TX queue full; ignoring %s from %s", cmd, sender)
-            return None
-        self.last_reply[sender] = now
+            log.warning("TX queue full; ignoring %s from %s", what, sender)
+            return False
+        if per_sender:
+            self.last_reply[sender] = now
         self.reply_times.append(now)
+        return True
+
+    def run_command(self, handler, cmd, ctx):
+        """Apply the airtime limits, then run a command. Returns the reply
+        text, or None if it was rate-limited or failed."""
+        if not self.reply_allowed(ctx["sender"], cmd):
+            return None
         try:
             return handler(ctx)
         except Exception:
@@ -921,10 +965,9 @@ class Bot:
                 log.exception("failed to handle a direct message")
 
     async def handle_dm(self, pkt, snr, rssi):
-        """A TXT_MSG addressed to us: dest hash | src hash | MAC | AES(ts |
-        flags | text). The src hash only narrows down the sender; the MAC
-        proves which advertised node it is. ACK it as the firmware would,
-        then answer it like a channel command, by direct message."""
+        """A TXT_MSG or REQ addressed to us: dest hash | src hash | MAC |
+        AES(...). The src hash only narrows down the sender; the MAC proves
+        which advertised node it is."""
         payload = pkt["payload"]
         for node in self.db.nodes_with_hash(payload[1]):
             pub = bytes.fromhex(node["pubkey"])
@@ -937,10 +980,65 @@ class Bot:
             if pt is not None:
                 break
         else:
-            log.info("direct message from an unknown node (hash 0x%02x); it needs to send an advert first",
-                     payload[1])
+            log.info("direct %s from an unknown node (hash 0x%02x); it needs to send an advert first",
+                     "request" if pkt["ptype"] == PAYLOAD_REQ else "message", payload[1])
             return
-        name = node["name"]
+        if pkt["ptype"] == PAYLOAD_REQ:
+            self.handle_request(pkt, snr, rssi, node["name"], pub, secret, pt)
+        else:
+            await self.handle_text(pkt, snr, rssi, node["name"], pub, secret, pt)
+
+    def note_inbound_route(self, name: str, pub: bytes, pkt):
+        """Something flooded reached us from them: the path it took is their
+        route to us, and our flooded PATH reply will tell them so. Its
+        reverse is our route to them."""
+        self.routes[pub] = (pkt["path"].hex(), pkt["plb"])
+        sub = self.db.get_sub(name)
+        if sub is not None and sub["pubkey"] == pub.hex():
+            self.db.refresh_sub_path(name, pkt["path"], pkt["plb"])
+        self.route_shared[name] = (pkt["path"].hex(), pkt["plb"])
+        self.flood_backoff.pop(name, None)
+
+    def handle_request(self, pkt, snr, rssi, name: str, pub: bytes, secret: bytes, pt: bytes):
+        """A REQ: AES(tag(4) | request type | ...). Only telemetry is
+        answered: a companion app's "path discovery" is a flooded telemetry
+        request, and our answer, a flooded PATH carrying the route the request
+        took plus the RESPONSE (tag echoed back | telemetry), gives the app the
+        route both ways. Asked direct, we answer with a RESPONSE packet."""
+        if len(pt) < 5 or pt[4] != REQ_GET_TELEMETRY:
+            log.debug("ignored request type %s from %s", pt[4] if len(pt) > 4 else None, name)
+            return
+        # the byte after the type is an inverse mask of the telemetry wanted (0 = everything)
+        if len(pt) > 5 and not (~pt[5] & TELEM_PERM_BASE):
+            log.debug("telemetry request from %s excludes base telemetry; not answering", name)
+            return
+        flooded = pkt["route"] in (ROUTE_FLOOD, ROUTE_TRANSPORT_FLOOD)
+        row_id = self.db.add(
+            direction="rx", channel=f"dm:{name}", sender=name, text="[telemetry request]",
+            sender_ts=struct.unpack_from("<I", pt)[0], hops=pkt["hops"], path=pkt["path"].hex(),
+            snr=snr, rssi=rssi, command="telemetry")
+        log.info("RX telemetry request [%s, %d hops] from %s", "flood" if flooded else "direct",
+                 pkt["hops"], name)
+        # no per-sender cooldown: path discovery often follows a DM within seconds
+        if not self.reply_allowed(name, "telemetry", per_sender=False):
+            return
+        uptime = int(time.time() - self.start)
+        reply = pt[:4] + lpp_telemetry(uptime)
+        if flooded:
+            self.note_inbound_route(name, pub, pkt)
+            packet = build_path_return(pub, self.pubkey, secret, pkt["path"], pkt["plb"],
+                                       extra_type=PAYLOAD_RESPONSE, extra=reply)
+        else:
+            to = self.peer(name, pub)
+            packet = build_response(pub, self.pubkey, secret, reply,
+                                    *((bytes.fromhex(to["path"]), to["plb"]) if to["plb"] >= 0 else ()))
+        # no jitter: the app is timing the round trip
+        self.enqueue(f"telemetry: battery 100% (4.20V), up {fmt_duration(uptime)}", packet=packet,
+                     label=f"dm:{name}", reply_to=row_id, cmd="telemetry", jitter=False)
+
+    async def handle_text(self, pkt, snr, rssi, name: str, pub: bytes, secret: bytes, pt: bytes):
+        """A TXT_MSG: AES(ts | flags | text). ACK it as the firmware would,
+        then answer it like a channel command, by direct message."""
         ts, flags = struct.unpack_from("<IB", pt)
         if flags >> 2:
             log.debug("ignored non-plain-text direct message (type %d) from %s", flags >> 2, name)
@@ -950,15 +1048,9 @@ class Bot:
         flooded = pkt["route"] in (ROUTE_FLOOD, ROUTE_TRANSPORT_FLOOD)
 
         if flooded:
-            # The path it took is their route to us. Answer like the firmware:
-            # a flooded PATH carrying that route (so their next messages and
-            # ACKs come direct) plus our ACK. Its reverse is our route to them.
-            self.routes[pub] = (pkt["path"].hex(), pkt["plb"])
-            sub = self.db.get_sub(name)
-            if sub is not None and sub["pubkey"] == pub.hex():
-                self.db.refresh_sub_path(name, pkt["path"], pkt["plb"])
-            self.route_shared[name] = (pkt["path"].hex(), pkt["plb"])
-            self.flood_backoff.pop(name, None)
+            # Answer like the firmware: a flooded PATH carrying the route it
+            # took (so their next messages and ACKs come direct) plus our ACK.
+            self.note_inbound_route(name, pub, pkt)
             packet = build_path_return(pub, self.pubkey, secret, pkt["path"], pkt["plb"],
                                        extra_type=PAYLOAD_ACK, extra=ack)
         else:
