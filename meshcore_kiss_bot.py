@@ -651,7 +651,7 @@ class Bot:
         self.commands = {
             "!ping": self.cmd_ping,
             "!help": lambda c: ("Commands: !ping !time !uptime !stats !echo <text> !heartbeaton !heartbeatoff "
-                                "!heartbeat. Also work by DM to me"),
+                                "!heartbeat. These commands also work by DM to me."),
             "!time": lambda c: datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
             "!uptime": lambda c: f"up {fmt_duration(time.time() - self.start)}",
             "!stats": self.cmd_stats,
@@ -989,8 +989,10 @@ class Bot:
         log.info("RX DM [%s, %d hops%s] %s: %s", "flood" if flooded else "direct", pkt["hops"],
                  f", SNR {snr:.1f} RSSI {rssi}" if snr is not None else "", name, msg)
 
+        if not handler:
+            cmd, handler = "!help", self.commands["!help"]  # unknown text gets help, logged as such
         to = self.peer(name, pub)
-        reply = self.run_command(handler or self.commands["!help"], cmd, {
+        reply = self.run_command(handler, cmd, {
             "sender": name, "args": args.strip(), "hops": pkt["hops"], "snr": snr, "rssi": rssi,
             "path": bytes.fromhex(to["path"]), "plb": to["plb"], "pubkey": pub})
         if reply is not None:

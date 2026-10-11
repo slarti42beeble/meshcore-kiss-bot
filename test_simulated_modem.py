@@ -431,6 +431,15 @@ async def main():
           "'time' without the ! works by DM")
 
     n = len(modem.sent)
+    alice.send_dm("heartbeatof", ts + 3, direct=True)   # a typo
+    await asyncio.sleep(0.5)
+    helps = [t for p, a, t in dms_in(modem, n, alice_secret) if t.startswith("Commands:")]
+    last_tx = db.db.execute("SELECT command FROM messages WHERE direction='tx' AND channel='dm:Alice' "
+                            "AND command != 'ack' ORDER BY id DESC LIMIT 1").fetchone()["command"]
+    check(helps and helps[0].endswith("These commands also work by DM to me.") and last_tx == "!help",
+          f"unknown DM text gets the help reply, logged as !help (logged {last_tx!r})")
+
+    n = len(modem.sent)
     rows = db.db.execute("SELECT COUNT(*) FROM messages WHERE direction='rx'").fetchone()[0]
     stranger = raw_pub(Ed25519PrivateKey.generate())
     RemoteNode(modem, stranger, hashlib.sha256(stranger).digest(), b"").send_dm("!ping", ts)
