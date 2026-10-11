@@ -1,0 +1,20 @@
+# Runs the simulated-modem test on every pull request (and on pushes to main),
+# so each PR shows a green tick or red cross. Auto-merge waits for this check.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python test_simulated_modem.py
