@@ -114,6 +114,20 @@ logged before this change have UTC `iso` values ending in `Z`.
 - Planned by the owner: more commands/features later. Add commands as entries in `self.commands`
   (handler receives a ctx dict and returns reply text).
 
+## Git workflow (owner's standing instruction — no need to ask at each step)
+
+For every change the owner asks for:
+1. `git pull origin main`, then create a short-named branch.
+2. Make the change, run `python test_simulated_modem.py`, update README/CLAUDE.md if behaviour changed.
+3. Commit, push the branch, open a PR with `gh pr create` (plain-English description).
+4. Enable GitHub auto-merge on the PR (merge method `merge`). GitHub merges it once the
+   `tests` check (`.github/workflows/tests.yml`) passes. Don't merge by hand around a red check;
+   fix the failure on the branch instead.
+5. Once merged: `git checkout main`, `git pull`, delete the local branch, and tell the owner
+   what changed and the PR link.
+Still ask first if the owner says to hold a change, or for anything destructive (force-push,
+deleting `main` history, changing repo settings).
+
 ## Git / publishing notes
 
 - `.gitignore` excludes `*.db` and `*.log`: the database holds other people's messages and node
