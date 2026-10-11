@@ -211,7 +211,7 @@ async def main():
         serial="x", baud=1, channel="#bot", name="MeshBot", freq=910.525, bw=62.5, sf=7, cr=5, power=22,
         cooldown=0, max_replies_per_min=100, delay_min=0, delay_max=0,
         heartbeat_interval=0.5, heartbeat_hours=2.2 / 3600,   # 2.2 s "24 hours" so expiry is testable
-        max_heartbeat_subs=1, advert_interval=0, ack_timeout=0.15)
+        max_heartbeat_subs=1, advert_interval=0, ack_timeout=0.15, timezone="America/Los_Angeles")
     db = m.BotDB(":memory:")
     bot = m.Bot(args, db)
     run = asyncio.create_task(bot.run_once())
@@ -240,6 +240,8 @@ async def main():
     await asyncio.sleep(0.4)
     check(sum(1 for s in db.db.execute("SELECT 1 FROM messages WHERE command='!time' AND direction='rx'")) == 1,
           "duplicate packet logged and answered once")
+    reply = channel_replies(modem)[-1]
+    check(reply.endswith((" PST", " PDT")), f"!time answers in Pacific time ({reply})")
 
     # --- !heartbeaton before any advert has been heard
     modem.inject(chan_pkt("Alice: !heartbeaton", b"\x11\x22"))
