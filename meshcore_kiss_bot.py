@@ -89,6 +89,7 @@ import argparse
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import logging.handlers
 import math
@@ -98,8 +99,10 @@ import sqlite3
 import struct
 import sys
 import time
+import urllib.parse
+import urllib.request
 from collections import OrderedDict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cryptography.exceptions import InvalidSignature
@@ -639,6 +642,101 @@ def fmt_duration(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------
+# !wx: East Sooke weather from Open-Meteo (free, no key; https://open-meteo.com)
+# --------------------------------------------------------------------------
+
+WX_PLACE = "East Sooke, BC"
+WX_LAT, WX_LON = 48.37, -123.68    # the East Sooke community, not anyone's node
+# Environment Canada's GEM models (HRDPS 2.5 km where available), metric units
+WX_URL = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+          "&current=temperature_2m,relative_humidity_2m,dew_point_2m,pressure_msl,"
+          "wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code,is_day"
+          "&hourly=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m"
+          "&timezone={tz}&forecast_days=2&models=gem_seamless&wind_speed_unit=kmh")
+WX_CACHE_SECONDS = 600             # one fetch serves every !wx for 10 minutes
+
+# WMO weather codes -> (text, day emoji, night emoji)
+WX_CODES = {
+    0: ("Clear", "\u2600\ufe0f", "\U0001f319"),
+    1: ("Mainly Clear", "\U0001f324\ufe0f", "\U0001f319"),
+    2: ("Partly Cloudy", "\u26c5", "\u2601\ufe0f"),
+    3: ("Overcast", "\u2601\ufe0f", "\u2601\ufe0f"),
+    45: ("Fog", "\U0001f32b\ufe0f", None), 48: ("Freezing Fog", "\U0001f32b\ufe0f", None),
+    51: ("Lt Drizzle", "\U0001f326\ufe0f", "\U0001f327\ufe0f"), 53: ("Drizzle", "\U0001f327\ufe0f", None),
+    55: ("Hvy Drizzle", "\U0001f327\ufe0f", None),
+    56: ("Frz Drizzle", "\U0001f9ca", None), 57: ("Frz Drizzle", "\U0001f9ca", None),
+    61: ("Lt Rain", "\U0001f326\ufe0f", "\U0001f327\ufe0f"), 63: ("Rain", "\U0001f327\ufe0f", None),
+    65: ("Hvy Rain", "\U0001f327\ufe0f", None),
+    66: ("Frz Rain", "\U0001f9ca", None), 67: ("Frz Rain", "\U0001f9ca", None),
+    71: ("Lt Snow", "\U0001f328\ufe0f", None), 73: ("Snow", "\U0001f328\ufe0f", None),
+    75: ("Hvy Snow", "\u2744\ufe0f", None), 77: ("Snow Grains", "\U0001f328\ufe0f", None),
+    80: ("Lt Showers", "\U0001f326\ufe0f", "\U0001f327\ufe0f"), 81: ("Showers", "\U0001f327\ufe0f", None),
+    82: ("Hvy Showers", "\U0001f327\ufe0f", None),
+    85: ("Snow Showers", "\U0001f328\ufe0f", None), 86: ("Snow Showers", "\U0001f328\ufe0f", None),
+    95: ("T-Storm", "\u26c8\ufe0f", None), 96: ("T-Storm", "\u26c8\ufe0f", None),
+    99: ("T-Storm", "\u26c8\ufe0f", None),
+}
+
+
+def wx_round(x: float) -> int:
+    return int(math.floor(x + 0.5))   # round half up, not Python's round-half-even
+
+
+def wx_sky(code: int, day: bool) -> str:
+    text, day_emoji, night_emoji = WX_CODES.get(code, ("?", "", None))
+    return (day_emoji if day or not night_emoji else night_emoji) + text
+
+
+def wx_wind(speed: float, direction: float, gust: float = 0.0) -> str:
+    if wx_round(speed) == 0:
+        return "Calm"
+    points = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    out = f"{points[wx_round(direction / 45) % 8]}{wx_round(speed)}"
+    return out + (f"G{wx_round(gust)}" if gust >= speed + 10 else "")
+
+
+def format_wx(d: dict, max_bytes: int) -> str:
+    """Open-Meteo JSON -> one line like the owner's example, metric:
+    'East Sooke, BC: Mon: <sky> 13°C 💨SW6 55%RH 💧4° 📊1018hPa | Tonight: <sky> L:6°C 💨SW4'.
+    Wind is km/h; Tonight covers the rest of the night until 06:00. Optional
+    parts are dropped if the line wouldn't fit in max_bytes."""
+    c = d["current"]
+    now = datetime.fromisoformat(c["time"])
+    head = f"{WX_PLACE}: {now:%a}: {wx_sky(c['weather_code'], c['is_day'])} {wx_round(c['temperature_2m'])}\u00b0C"
+    parts = [
+        ("wind", "\U0001f4a8" + wx_wind(c["wind_speed_10m"], c["wind_direction_10m"], c.get("wind_gusts_10m") or 0)),
+        ("rh", f"{wx_round(c['relative_humidity_2m'])}%RH"),
+        ("dew", f"\U0001f4a7{wx_round(c['dew_point_2m'])}\u00b0"),
+        ("hpa", f"\U0001f4ca{wx_round(c['pressure_msl'])}hPa"),
+    ]
+
+    # tonight: from 18:00 (or now, if later) until 06:00
+    h = d["hourly"]
+    start = now if (now.hour >= 18 or now.hour < 6) else now.replace(hour=18, minute=0)
+    end = start.replace(hour=6, minute=0) + (timedelta(days=1) if start.hour >= 6 else timedelta())
+    night = [i for i, t in enumerate(h["time"])
+             if start - timedelta(hours=1) < datetime.fromisoformat(t) < end]
+    tonight = ""
+    if night:
+        codes = [h["weather_code"][i] for i in night]
+        code = max(set(codes), key=lambda k: (codes.count(k), k))   # most common; ties -> worse
+        low = min(h["temperature_2m"][i] for i in night)
+        speed = sum(h["wind_speed_10m"][i] for i in night) / len(night)
+        x = sum(math.sin(math.radians(h["wind_direction_10m"][i])) for i in night)
+        y = sum(math.cos(math.radians(h["wind_direction_10m"][i])) for i in night)
+        tonight = (f" | Tonight: {wx_sky(code, False)} L:{wx_round(low)}\u00b0C "
+                   f"\U0001f4a8{wx_wind(speed, math.degrees(math.atan2(x, y)) % 360)}")
+
+    def line(ps):
+        return " ".join([head] + [t for _, t in ps]) + tonight
+    for drop in ("dew", "hpa", "rh"):   # least useful first
+        if len(line(parts).encode("utf-8")) <= max_bytes:
+            break
+        parts = [pt for pt in parts if pt[0] != drop]
+    return line(parts)
+
+
+# --------------------------------------------------------------------------
 # the bot
 # --------------------------------------------------------------------------
 
@@ -687,12 +785,15 @@ class Bot:
         self.routes = {}                   # pubkey -> (path hex, plb) from them to us, for non-subscribers
         self.dm_queue = asyncio.Queue()    # received direct messages awaiting dm_worker
         self.recent_dms = OrderedDict()    # (pubkey, ts, text) of DMs already answered
+        self.wx_cache = None               # (monotonic time, Open-Meteo JSON)
+        self.bg_tasks = set()              # replies still being worked out (e.g. !wx fetching)
 
-        # command table: "!cmd" -> handler(ctx) -> reply text
+        # command table: "!cmd" -> handler(ctx) -> reply text (or a coroutine for slow
+        # commands like !wx; the reply is then sent when it finishes)
         self.commands = {
             "!ping": self.cmd_ping,
-            "!help": lambda c: ("Commands: !ping !time !uptime !stats !echo <text> !heartbeaton !heartbeatoff "
-                                "!heartbeat. These commands also work by DM to me."),
+            "!help": lambda c: ("Commands: !ping !wx !time !uptime !stats !echo <text> !heartbeaton "
+                                "!heartbeatoff !heartbeat. These commands also work by DM to me."),
             "!time": lambda c: datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
             "!uptime": lambda c: f"up {fmt_duration(time.time() - self.start)}",
             "!stats": self.cmd_stats,
@@ -700,9 +801,40 @@ class Bot:
             "!heartbeaton": self.cmd_heartbeat_on,
             "!heartbeatoff": self.cmd_heartbeat_off,
             "!heartbeat": self.cmd_heartbeat_status,
+            "!wx": self.cmd_wx,
         }
 
     # ---- commands
+    async def cmd_wx(self, c):
+        try:
+            if self.wx_cache is None or time.monotonic() - self.wx_cache[0] > WX_CACHE_SECONDS:
+                data = await asyncio.get_running_loop().run_in_executor(None, self.fetch_wx)
+                self.wx_cache = (time.monotonic(), data)
+            # leave room for "<bot name>: " in front when posted to the channel
+            return format_wx(self.wx_cache[1], MAX_TEXT_BYTES - len(self.name.encode("utf-8")) - 2)
+        except Exception as e:
+            log.warning("weather fetch failed: %s", e)
+            return "weather unavailable right now, try again later"
+
+    def fetch_wx(self) -> dict:
+        """Blocking HTTP GET (run in a thread). Replaced by a stub in the tests."""
+        url = WX_URL.format(lat=WX_LAT, lon=WX_LON, tz=urllib.parse.quote(self.args.timezone, safe=""))
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return json.load(r)
+
+    def send_later(self, reply, send):
+        """Finish a slow command's reply (a coroutine) in the background, then
+        hand the text to send() (which may itself be async)."""
+        async def finish():
+            text = await reply
+            if text:
+                result = send(text)
+                if asyncio.iscoroutine(result):
+                    await result
+        task = asyncio.get_running_loop().create_task(finish())
+        self.bg_tasks.add(task)
+        task.add_done_callback(self.bg_tasks.discard)
+
     def cmd_ping(self, c):
         hops = c["hops"]
         out = f"pong @{c['sender']} ({hops} hop{'s' if hops != 1 else ''}"
@@ -916,7 +1048,9 @@ class Bot:
         reply = self.run_command(handler, cmd, {
             "sender": sender, "args": args.strip(), "hops": pkt["hops"], "snr": snr, "rssi": rssi,
             "path": pkt["path"], "plb": pkt["plb"]})
-        if reply is not None:
+        if asyncio.iscoroutine(reply):
+            self.send_later(reply, lambda text: self.enqueue(text, reply_to=row_id, cmd=cmd))
+        elif reply is not None:
             self.enqueue(reply, reply_to=row_id, cmd=cmd)
 
     def reply_allowed(self, sender, what, per_sender=True) -> bool:
@@ -1096,9 +1230,13 @@ class Bot:
         reply = self.run_command(handler, cmd, {
             "sender": name, "args": args.strip(), "hops": pkt["hops"], "snr": snr, "rssi": rssi,
             "path": bytes.fromhex(to["path"]), "plb": to["plb"], "pubkey": pub})
-        if reply is not None:
-            reply = reply.encode("utf-8")[:MAX_TEXT_BYTES].decode("utf-8", errors="ignore")
-            await self.send_direct(self.peer(name, pub), reply, cmd, reply_to=row_id, jitter=True)
+        def send(text):
+            text = text.encode("utf-8")[:MAX_TEXT_BYTES].decode("utf-8", errors="ignore")
+            return self.send_direct(self.peer(name, pub), text, cmd, reply_to=row_id, jitter=True)
+        if asyncio.iscoroutine(reply):
+            self.send_later(reply, send)
+        elif reply is not None:
+            await send(reply)
 
     # ---- serial tasks
     async def serial_reader(self):

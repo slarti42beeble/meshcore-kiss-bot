@@ -11,6 +11,10 @@ contacts to use the channel commands.
 
 - Configures the modem's radio settings (frequency, bandwidth, SF, CR, TX power) from the command
   line on every connect, since the KISS modem firmware does not remember them across reboots.
+- `!wx`: current East Sooke, BC weather plus tonight's outlook in one message (metric), e.g.
+  `East Sooke, BC: Mon: ☀️Clear 13°C 💨SW6 55%RH 💧4° 📊1018hPa | Tonight: ☁️Overcast L:6°C 💨W4`.
+  Wind is km/h. Data from [Open-Meteo](https://open-meteo.com) (Environment Canada's GEM
+  models, CC BY 4.0); needs internet access, and one fetch is reused for 10 minutes.
 - Command bot on a hashtag channel: `!ping` (with hop count, SNR, RSSI), `!time`, `!uptime`,
   `!stats`, `!echo <text>`, `!help`.
 - The same commands also work by **direct message** to the bot (the `!` is optional there),
