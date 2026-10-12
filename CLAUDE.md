@@ -32,7 +32,9 @@ logged before this change have UTC `iso` values ending in `Z`.
   - DMs to the bot: received, decrypted, ACKed (the sender's app marks them delivered), and the
     bot's replies ACKed by the sender; reciprocal PATH packets sent;
   - companion app "path discovery" (2026-10-11): the flooded telemetry request is answered and
-    the app shows the route to the bot.
+    the app shows the route to the bot;
+  - full telemetry requests (2026-10-11): the app shows Voltage 4.200 V / 100 % and the
+    `--lat/--lon/--alt` GPS position, with no channel headings, like a real companion node.
 - **Not yet seen on air:** the no-ACK path (flood fallback, route learning from PATH replies,
   flood backoff). There has been no `no_ack` row yet, so these are proven only by the
   simulated-modem test, which shows the code is self-consistent, not that firmware agrees.
