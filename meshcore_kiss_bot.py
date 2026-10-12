@@ -55,10 +55,11 @@ MeshCore firmware does, and the reply comes back as a direct message, with
 the same ACK tracking and flood fallback as heartbeats. A DM proves who sent
 it, unlike a name in the channel.
 
-TELEMETRY / PATH DISCOVERY: a companion app's "path discovery" is a flooded
-telemetry request. The bot answers it like a companion node: battery 100 %
-(4.20 V) and its uptime, sent back inside a PATH packet that carries the route
-the request took, which is what the app needs.
+TELEMETRY / PATH DISCOVERY: the bot answers telemetry requests like a companion
+node: battery voltage (a full 4.20 V, shown as 100 %) and, if --lat/--lon are
+given, a fixed GPS position. A companion app's "path discovery" is a flooded
+telemetry request; the answer goes back inside a PATH packet that carries the
+route the request took, which is what the app needs.
 
 MESSAGE LOGGING: every channel message heard, every message sent (channel
 replies, direct heartbeats and adverts) is written to a SQLite database
@@ -260,10 +261,10 @@ ADV_TYPE_CHAT = 1
 # Requests (REQ payloads) and telemetry, as in the MeshCore companion firmware
 REQ_GET_TELEMETRY = 0x03
 TELEM_PERM_BASE = 0x01      # 'base' telemetry: the node's own battery
+TELEM_PERM_LOCATION = 0x02  # its position
 TELEM_CHANNEL_SELF = 1      # CayenneLPP channel for the node itself
-LPP_GENERIC_SENSOR = 100    # 4 bytes, unsigned
 LPP_VOLTAGE = 116           # 2 bytes, 0.01 V
-LPP_PERCENTAGE = 120        # 1 byte, 1-100 %
+LPP_GPS = 136               # 3+3+3 bytes signed: lat, lon (0.0001 deg), alt (0.01 m)
 
 # Payload max is 184 bytes: 3 bytes channel hash+MAC, then AES blocks holding
 # 5 bytes (timestamp+flags) + text. 150 text bytes keeps us safely inside it.
@@ -418,14 +419,18 @@ def build_response(dest_pub: bytes, src_pub: bytes, secret32: bytes, data: bytes
     return bytes([(PAYLOAD_RESPONSE << 2) | ROUTE_DIRECT, plb]) + reverse_path(path, plb) + payload
 
 
-def lpp_telemetry(uptime_s: int) -> bytes:
-    """Minimal CayenneLPP telemetry (channel | type | big-endian value): the
-    bot has no battery, so report it full (100 %, and 4.20 V, which is what
-    the companion firmware itself sends), plus the bot's uptime in seconds as
-    a generic sensor on channel 2 (LPP has no uptime type)."""
-    return (bytes([TELEM_CHANNEL_SELF, LPP_VOLTAGE]) + struct.pack(">H", 420)
-            + bytes([TELEM_CHANNEL_SELF, LPP_PERCENTAGE, 100])
-            + bytes([2, LPP_GENERIC_SENSOR]) + struct.pack(">I", min(uptime_s, 0xFFFFFFFF)))
+def lpp_telemetry(location=None) -> bytes:
+    """CayenneLPP telemetry (channel | type | big-endian value) shaped like a
+    companion node's, everything on channel 1: battery voltage (the bot has
+    no battery, so a full 4.20 V; apps show it as 100 %) and, if `location`
+    = (lat, lon, alt) is given, a GPS reading."""
+    out = bytes([TELEM_CHANNEL_SELF, LPP_VOLTAGE]) + struct.pack(">H", 420)
+    if location is not None:
+        lat, lon, alt = location
+        out += bytes([TELEM_CHANNEL_SELF, LPP_GPS]) + b"".join(
+            int(round(v * mult)).to_bytes(3, "big", signed=True)
+            for v, mult in ((lat, 10000), (lon, 10000), (alt, 100)))
+    return out
 
 
 def build_ack(ack: bytes, path: bytes = None, plb: int = 0) -> bytes:
@@ -1009,9 +1014,13 @@ class Bot:
             log.debug("ignored request type %s from %s", pt[4] if len(pt) > 4 else None, name)
             return
         # the byte after the type is an inverse mask of the telemetry wanted (0 = everything)
-        if len(pt) > 5 and not (~pt[5] & TELEM_PERM_BASE):
+        wanted = ~pt[5] & 0xFF if len(pt) > 5 else 0xFF
+        if not wanted & TELEM_PERM_BASE:
             log.debug("telemetry request from %s excludes base telemetry; not answering", name)
             return
+        location = None
+        if wanted & TELEM_PERM_LOCATION and self.args.lat is not None:
+            location = (self.args.lat, self.args.lon, self.args.alt)
         flooded = pkt["route"] in (ROUTE_FLOOD, ROUTE_TRANSPORT_FLOOD)
         row_id = self.db.add(
             direction="rx", channel=f"dm:{name}", sender=name, text="[telemetry request]",
@@ -1022,8 +1031,7 @@ class Bot:
         # no per-sender cooldown: path discovery often follows a DM within seconds
         if not self.reply_allowed(name, "telemetry", per_sender=False):
             return
-        uptime = int(time.time() - self.start)
-        reply = pt[:4] + lpp_telemetry(uptime)
+        reply = pt[:4] + lpp_telemetry(location)
         if flooded:
             self.note_inbound_route(name, pub, pkt)
             packet = build_path_return(pub, self.pubkey, secret, pkt["path"], pkt["plb"],
@@ -1033,7 +1041,8 @@ class Bot:
             packet = build_response(pub, self.pubkey, secret, reply,
                                     *((bytes.fromhex(to["path"]), to["plb"]) if to["plb"] >= 0 else ()))
         # no jitter: the app is timing the round trip
-        self.enqueue(f"telemetry: battery 100% (4.20V), up {fmt_duration(uptime)}", packet=packet,
+        where = f", location {location[0]:.4f},{location[1]:.4f} @ {location[2]:g}m" if location else ""
+        self.enqueue(f"telemetry: 4.20V (100%){where}", packet=packet,
                      label=f"dm:{name}", reply_to=row_id, cmd="telemetry", jitter=False)
 
     async def handle_text(self, pkt, snr, rssi, name: str, pub: bytes, secret: bytes, pt: bytes):
@@ -1448,9 +1457,16 @@ def main():
     p.add_argument("--flood-backoff-max", type=float, default=30.0,
                    help="when a subscriber is out of range, flooded heartbeats back off (2x, 4x, 8x... "
                         "the interval) up to this many minutes apart (default 30)")
+    p.add_argument("--lat", type=float, help="latitude to report in telemetry, e.g. 48.3566 (with --lon)")
+    p.add_argument("--lon", type=float, help="longitude to report in telemetry, e.g. -123.6465 (with --lat)")
+    p.add_argument("--alt", type=float, default=0.0, help="altitude in metres to report with --lat/--lon (default 0)")
     p.add_argument("--advert-interval", type=float, default=12.0,
                    help="hours between the bot's own adverts; 0 = only at startup and on demand (default 12)")
     args = p.parse_args()
+    if (args.lat is None) != (args.lon is None):
+        p.error("--lat and --lon must be given together")
+    if args.lat is not None and not (-90 <= args.lat <= 90 and -180 <= args.lon <= 180):
+        p.error("--lat must be -90..90 and --lon -180..180")
     try:
         ZoneInfo(args.timezone)
     except (ZoneInfoNotFoundError, ValueError):

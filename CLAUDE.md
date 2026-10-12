@@ -87,8 +87,9 @@ logged before this change have UTC `iso` values ending in `Z`.
 - **Telemetry REQ** (type 0, checked against meshcore-dev/MeshCore companion firmware):
   `dest | src | MAC | AES(tag(4) | 0x03 | inverse perm mask | 3 reserved | 4 random)`. App
   "path discovery" floods one with mask `~0x01` (base only). Answer: tag echoed + CayenneLPP
-  (big-endian; ch1 voltage type 116 = 0.01 V, ch1 percentage 120, ch2 generic sensor 100 =
-  uptime s). Flooded REQ -> flooded PATH (route = the REQ's path, extra_type 1 RESPONSE,
+  (big-endian, all on channel 1 so apps don't show channel headings: voltage type 116 = 0.01 V,
+  fixed 4.20 V; GPS type 136 = 3+3+3 bytes signed, lat/lon x10000, alt x100, only when the
+  request's mask allows location (0x02) and `--lat/--lon` are set). Flooded REQ -> flooded PATH (route = the REQ's path, extra_type 1 RESPONSE,
   extra = answer); direct REQ -> RESPONSE packet (type 1). The app matches the echoed tag and,
   per the firmware source, currently discards the telemetry itself.
 - **Advert**: `pubkey(32) | ts(4) | Ed25519 signature(64) | appdata`, signature over
@@ -120,7 +121,8 @@ logged before this change have UTC `iso` values ending in `Z`.
   flood fallback). Retries of a DM (same ts/text, attempt+1) are re-ACKed but answered once.
   `!heartbeaton` by DM uses the sender's proven key. Routes for non-subscribers live in
   memory (`Bot.routes`); subscribers' routes stay in `hb_subs`.
-- **Telemetry**: answered for any heard node (no per-sender cooldown, global limit applies), no
+- **Telemetry** (owner's choice: look like a companion's: voltage + optional fixed GPS, no
+  uptime/percentage/extra channels; position via `--lat/--lon/--alt`, never committed): answered for any heard node (no per-sender cooldown, global limit applies), no
   jitter so the app's round-trip timer isn't exceeded. Requests that mask out base telemetry
   get no answer, as in the firmware.
 - Message logging is a core requirement: every rx and tx row is stored, including heartbeats
