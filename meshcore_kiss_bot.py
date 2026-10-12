@@ -260,6 +260,7 @@ PAYLOAD_PATH = 8
 PAYLOAD_MULTIPART = 10
 
 ADV_TYPE_CHAT = 1
+ADV_TYPE_REPEATER = 2
 
 # Requests (REQ payloads) and telemetry, as in the MeshCore companion firmware
 REQ_GET_TELEMETRY = 0x03
@@ -460,7 +461,8 @@ def parse_path_return(plaintext: bytes):
 
 def parse_advert(payload: bytes):
     """Verify and decode an ADVERT payload: pubkey(32) | timestamp(4) |
-    signature(64) | appdata. Returns (pubkey, adv_type, name) or None."""
+    signature(64) | appdata. Returns (pubkey, adv_type, name, location) or
+    None; location is (lat, lon) in degrees, or None if not advertised."""
     if len(payload) < 101:
         return None
     pub, ts, sig, app = payload[:32], payload[32:36], payload[36:100], payload[100:]
@@ -470,8 +472,12 @@ def parse_advert(payload: bytes):
         return None
     flags = app[0]
     i = 1
-    if flags & 0x10:
-        i += 8      # lat + lon
+    location = None
+    if flags & 0x10 and len(app) >= 9:
+        lat, lon = struct.unpack_from("<ii", app, 1)   # millionths of a degree
+        if (lat, lon) != (0, 0):                        # 0,0 = no position set
+            location = (lat / 1e6, lon / 1e6)
+        i += 8
     if flags & 0x20:
         i += 2      # feature 1
     if flags & 0x40:
@@ -479,7 +485,20 @@ def parse_advert(payload: bytes):
     name = ""
     if flags & 0x80:
         name = app[i:].split(b"\x00", 1)[0].decode("utf-8", errors="replace")
-    return pub, flags & 0x0F, name
+    return pub, flags & 0x0F, name, location
+
+
+def km_between(a, b) -> float:
+    """Great-circle distance in km between two (lat, lon) points."""
+    (la1, lo1), (la2, lo2) = [(math.radians(x), math.radians(y)) for x, y in (a, b)]
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(h))
+
+
+def path_hashes(path: bytes, plb: int):
+    """Split a path into its per-hop repeater hashes (1-3 bytes each)."""
+    size = (plb >> 6) + 1
+    return [path[i:i + size] for i in range(0, len(path), size)]
 
 
 def build_advert(pub: bytes, signature: bytes, ts: bytes, app: bytes) -> bytes:
@@ -519,13 +538,15 @@ class BotDB:
             CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
 
-            -- chat nodes whose signed adverts we have heard: name -> public key
+            -- nodes whose signed adverts we have heard: name -> public key (and position)
             CREATE TABLE IF NOT EXISTS nodes (
                 pubkey     TEXT PRIMARY KEY,    -- hex
                 name       TEXT,
                 adv_type   INTEGER,
                 first_seen REAL,
-                last_seen  REAL
+                last_seen  REAL,
+                lat        REAL,                -- advertised position, if any
+                lon        REAL
             );
             CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name);
 
@@ -540,6 +561,10 @@ class BotDB:
                 expires_at  REAL NOT NULL
             );
         """)
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(nodes)")}
+        for col in ("lat", "lon"):          # databases made before positions were kept
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE nodes ADD COLUMN {col} REAL")
         self.db.commit()
 
     # ---- message log
@@ -570,14 +595,26 @@ class BotDB:
         return rx, senders, tx
 
     # ---- heard nodes
-    def note_node(self, pubkey: bytes, name: str, adv_type: int):
+    def note_node(self, pubkey: bytes, name: str, adv_type: int, location=None):
         now = time.time()
+        lat, lon = location if location else (None, None)
         self.db.execute(
-            """INSERT INTO nodes (pubkey, name, adv_type, first_seen, last_seen) VALUES (?,?,?,?,?)
+            """INSERT INTO nodes (pubkey, name, adv_type, first_seen, last_seen, lat, lon) VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(pubkey) DO UPDATE SET name=excluded.name, adv_type=excluded.adv_type,
-                                                 last_seen=excluded.last_seen""",
-            (pubkey.hex(), name, adv_type, now, now))
+                                                 last_seen=excluded.last_seen,
+                                                 lat=excluded.lat, lon=excluded.lon""",
+            (pubkey.hex(), name, adv_type, now, now, lat, lon))
         self.db.commit()
+
+    def repeater_location(self, h: bytes):
+        """Position of the repeater whose public key starts with path hash h,
+        if exactly one such repeater is known and it advertised a position."""
+        rows = self.db.execute(
+            "SELECT lat, lon FROM nodes WHERE substr(pubkey, 1, ?)=? AND adv_type=?",
+            (len(h) * 2, h.hex(), ADV_TYPE_REPEATER)).fetchall()
+        if len(rows) == 1 and rows[0]["lat"] is not None:
+            return rows[0]["lat"], rows[0]["lon"]
+        return None
 
     def nodes_with_hash(self, h: int):
         """Chat nodes (heard advertising) whose public key starts with byte h:
@@ -836,11 +873,50 @@ class Bot:
         task.add_done_callback(self.bg_tasks.discard)
 
     def cmd_ping(self, c):
-        hops = c["hops"]
-        out = f"pong @{c['sender']} ({hops} hop{'s' if hops != 1 else ''}"
+        """pong @name | 88,77,89 (3 hops) | SNR: -1.5 dB | RSSI: -118 dBm |
+        51.3km (2 segs) | 815ms | Rx'd: 10:17:42. Distance adds up the legs
+        between consecutive repeaters on the path whose positions we've heard
+        advertised; the ms are from the sender's timestamp to our receiving it
+        (only meaningful if both clocks are right). Parts are shortened or
+        dropped to fit one message."""
+        plb, hops = c["plb"], c["hops"]
+        hashes = path_hashes(c["path"], plb) if plb is not None and plb >= 0 else None
+        if hashes is None:
+            route_full = route_short = "route unknown"
+        elif not hashes:
+            route_full = route_short = "direct (0 hops)"
+        else:
+            n = f" ({len(hashes)} hop{'s' if len(hashes) != 1 else ''})"
+            route_full = ",".join(h.hex() for h in hashes) + n
+            route_short = ",".join(h[:1].hex() for h in hashes) + n   # 1st byte only, if space is short
+
+        parts = [("route", route_full)]
         if c["snr"] is not None:
-            out += f", SNR {c['snr']:.1f}dB RSSI {c['rssi']}dBm"
-        return out + ")"
+            parts += [("snr", f"SNR: {c['snr']:.1f} dB"), ("rssi", f"RSSI: {c['rssi']} dBm")]
+        if hashes:
+            spots = [self.db.repeater_location(h) for h in hashes]
+            legs = [km_between(a, b) for a, b in zip(spots, spots[1:]) if a and b]
+            if legs:
+                parts.append(("km", f"{sum(legs):.1f}km ({len(legs)} seg{'s' if len(legs) != 1 else ''})"))
+        rx_time = c.get("rx_time") or time.time()
+        if c.get("sender_ts"):
+            ms = int((rx_time - c["sender_ts"]) * 1000)
+            if 0 <= ms < 3_600_000:          # otherwise a clock is off; don't show nonsense
+                parts.append(("ms", f"{ms}ms"))
+        parts.append(("rx", "Rx'd: " + datetime.fromtimestamp(rx_time, self.tz).strftime("%H:%M:%S")))
+
+        limit = MAX_TEXT_BYTES - len(self.name.encode("utf-8")) - 2   # room for "<bot name>: "
+
+        def line():
+            return " | ".join([f"pong @{c['sender']}"] + [t for _, t in parts])
+        for step in ("short", "rx", "ms", "rssi"):
+            if len(line().encode("utf-8")) <= limit:
+                break
+            if step == "short":
+                parts[0] = ("route", route_short)
+            else:
+                parts = [pt for pt in parts if pt[0] != step]
+        return line()
 
     def cmd_stats(self, c):
         rx, senders, tx = self.db.summary()
@@ -932,10 +1008,10 @@ class Bot:
         if not parsed:
             log.debug("ignored advert that failed signature/format check")
             return
-        pub, adv_type, name = parsed
+        pub, adv_type, name, location = parsed
         if pub == self.pubkey or not name:
             return
-        self.db.note_node(pub, name, adv_type)
+        self.db.note_node(pub, name, adv_type, location)
         log.debug("heard advert: %s (type %d) %s", name, adv_type, pub.hex()[:12])
 
     def handle_ack(self, ack: bytes):
@@ -981,6 +1057,7 @@ class Bot:
     def handle_rx(self, raw: bytes, meta):
         """raw = one received MeshCore packet; meta = (snr, rssi) or None."""
         snr, rssi = meta if meta else (None, None)
+        rx_time = time.time()
         log.debug("rx packet %d bytes: %s", len(raw), raw.hex())
         pkt = parse_packet(raw)
         if not pkt:
@@ -1004,7 +1081,7 @@ class Bot:
             if (len(pl) >= 4 + 16 and pl[0] == self.pubkey[0]
                     and not self.seen_before(hashlib.sha256(pl).digest())):
                 if self.dm_queue.qsize() < 16:
-                    self.dm_queue.put_nowait((pkt, snr, rssi))  # decrypting needs the modem: dm_worker
+                    self.dm_queue.put_nowait((pkt, snr, rssi, rx_time))  # decrypting needs the modem
                 else:
                     log.warning("too many direct packets waiting; dropped one")
             return
@@ -1047,7 +1124,7 @@ class Bot:
             return
         reply = self.run_command(handler, cmd, {
             "sender": sender, "args": args.strip(), "hops": pkt["hops"], "snr": snr, "rssi": rssi,
-            "path": pkt["path"], "plb": pkt["plb"]})
+            "path": pkt["path"], "plb": pkt["plb"], "sender_ts": sender_ts, "rx_time": rx_time})
         if asyncio.iscoroutine(reply):
             self.send_later(reply, lambda text: self.enqueue(text, reply_to=row_id, cmd=cmd))
         elif reply is not None:
@@ -1097,13 +1174,13 @@ class Bot:
 
     async def dm_worker(self):
         while True:
-            pkt, snr, rssi = await self.dm_queue.get()
+            pkt, snr, rssi, rx_time = await self.dm_queue.get()
             try:
-                await self.handle_dm(pkt, snr, rssi)
+                await self.handle_dm(pkt, snr, rssi, rx_time)
             except Exception:
                 log.exception("failed to handle a direct message")
 
-    async def handle_dm(self, pkt, snr, rssi):
+    async def handle_dm(self, pkt, snr, rssi, rx_time=None):
         """A TXT_MSG or REQ addressed to us: dest hash | src hash | MAC |
         AES(...). The src hash only narrows down the sender; the MAC proves
         which advertised node it is."""
@@ -1125,7 +1202,7 @@ class Bot:
         if pkt["ptype"] == PAYLOAD_REQ:
             self.handle_request(pkt, snr, rssi, node["name"], pub, secret, pt)
         else:
-            await self.handle_text(pkt, snr, rssi, node["name"], pub, secret, pt)
+            await self.handle_text(pkt, snr, rssi, node["name"], pub, secret, pt, rx_time)
 
     def note_inbound_route(self, name: str, pub: bytes, pkt):
         """Something flooded reached us from them: the path it took is their
@@ -1179,7 +1256,8 @@ class Bot:
         self.enqueue(f"telemetry: 4.20V (100%){where}", packet=packet,
                      label=f"dm:{name}", reply_to=row_id, cmd="telemetry", jitter=False)
 
-    async def handle_text(self, pkt, snr, rssi, name: str, pub: bytes, secret: bytes, pt: bytes):
+    async def handle_text(self, pkt, snr, rssi, name: str, pub: bytes, secret: bytes, pt: bytes,
+                          rx_time=None):
         """A TXT_MSG: AES(ts | flags | text). ACK it as the firmware would,
         then answer it like a channel command, by direct message."""
         ts, flags = struct.unpack_from("<IB", pt)
@@ -1226,10 +1304,14 @@ class Bot:
 
         if not handler:
             cmd, handler = "!help", self.commands["!help"]  # unknown text gets help, logged as such
+        # A direct-routed packet arrives with its path used up; the route it
+        # took is the one we hold for them (which we told them to use).
         to = self.peer(name, pub)
         reply = self.run_command(handler, cmd, {
-            "sender": name, "args": args.strip(), "hops": pkt["hops"], "snr": snr, "rssi": rssi,
-            "path": bytes.fromhex(to["path"]), "plb": to["plb"], "pubkey": pub})
+            "sender": name, "args": args.strip(), "snr": snr, "rssi": rssi,
+            "hops": to["plb"] & 0x3F if to["plb"] >= 0 else None,
+            "path": bytes.fromhex(to["path"]), "plb": to["plb"], "pubkey": pub,
+            "sender_ts": ts, "rx_time": rx_time})
         def send(text):
             text = text.encode("utf-8")[:MAX_TEXT_BYTES].decode("utf-8", errors="ignore")
             return self.send_direct(self.peer(name, pub), text, cmd, reply_to=row_id, jitter=True)

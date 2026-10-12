@@ -95,7 +95,8 @@ logged before this change have UTC `iso` values ending in `Z`.
   extra = answer); direct REQ -> RESPONSE packet (type 1). The app matches the echoed tag and,
   per the firmware source, currently discards the telemetry itself.
 - **Advert**: `pubkey(32) | ts(4) | Ed25519 signature(64) | appdata`, signature over
-  `pubkey | ts | appdata`. App flags: low nibble = node type (1 = chat), 0x10 lat/lon, 0x20/0x40
+  `pubkey | ts | appdata`. App flags: low nibble = node type (1 = chat, 2 = repeater), 0x10 lat/lon
+  (int32 LE millionths of a degree each, right after the flags; 0,0 = unset; stored in `nodes`), 0x20/0x40
   feature words, 0x80 name present.
 - Max KISS data payload is 255 bytes; text replies are capped at 150 bytes (`MAX_TEXT_BYTES`).
 
@@ -127,6 +128,13 @@ logged before this change have UTC `iso` values ending in `Z`.
   uptime/percentage/extra channels; position via `--lat/--lon/--alt`, never committed): answered for any heard node (no per-sender cooldown, global limit applies), no
   jitter so the app's round-trip timer isn't exceeded. Requests that mask out base telemetry
   get no answer, as in the firmware.
+- **`!ping`** (owner's format): `pong @name | <hashes> (N hops) | SNR: x dB | RSSI: y dBm |
+  <km> (n segs) | <ms> | Rx'd: HH:MM:SS`. Hashes shown as on air (1-3 bytes each; first byte
+  only if space is short). km = sum of legs between consecutive path repeaters with a known
+  advertised position (repeater = adv_type 2, matched by hash prefix, only if unique); omitted
+  if no leg is known. ms = receive time - sender timestamp (omitted if negative or > 1 h).
+  Shortening order to fit: 1-byte hashes, drop Rx'd, ms, RSSI. In DMs the route shown is the
+  one we hold for them (a direct packet's path is used up on the way).
 - **`!wx`** (owner's request): fixed to East Sooke, BC (`WX_LAT/WX_LON` = the community, not the
   owner's node). Source: Open-Meteo `gem_seamless` (free, no key; owner was told scraping The
   Weather Network is fragile/against ToS and ECCC has no Sooke city page). Format follows the
