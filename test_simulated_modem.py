@@ -17,6 +17,9 @@ import argparse
 import asyncio
 import hashlib
 import hmac
+import re
+import sqlite3
+import tempfile
 import os
 import struct
 import sys
@@ -116,10 +119,14 @@ def chan_pkt(text, path=b""):
     return bytes([(m.PAYLOAD_GRP_TXT << 2) | m.ROUTE_FLOOD, len(path)]) + path + bytes([chan.hash]) + mac + ct
 
 
-def make_advert(key, name):
+def make_advert(key, name, adv_type=m.ADV_TYPE_CHAT, loc=None):
+    """A signed advert; loc = (lat, lon) adds a position (millionths of a degree)."""
     pub = raw_pub(key)
     ts = struct.pack("<I", int(time.time()))
-    app = bytes([0x80 | m.ADV_TYPE_CHAT]) + name.encode()
+    app = bytes([0x80 | (0x10 if loc else 0) | adv_type])
+    if loc:
+        app += struct.pack("<ii", round(loc[0] * 1e6), round(loc[1] * 1e6))
+    app += name.encode()
     return m.build_advert(pub, key.sign(pub + ts + app), ts, app)
 
 
@@ -317,7 +324,7 @@ async def main():
     # --- startup advert is signed correctly and verifies
     adverts = [s for s in modem.sent if m.parse_packet(s)["ptype"] == m.PAYLOAD_ADVERT]
     check(bool(adverts), "bot broadcast an advert at startup")
-    pub, adv_type, name = m.parse_advert(m.parse_packet(adverts[0])["payload"])
+    pub, adv_type, name, _loc = m.parse_advert(m.parse_packet(adverts[0])["payload"])
     check((pub, adv_type, name) == (modem.pub, m.ADV_TYPE_CHAT, "MeshBot"), "bot advert verifies and carries its name")
 
     # --- channel command: !ping
@@ -325,6 +332,49 @@ async def main():
     await asyncio.sleep(0.4)
     ping = [r for r in channel_replies(modem) if "pong" in r]
     check(bool(ping) and "@Carol" in ping[-1] and "1 hop" in ping[-1], f"!ping answered with hop count ({ping[-1] if ping else None})")
+
+    # --- !ping over several repeaters, with distance (repeaters' positions from their adverts)
+    reps = []
+    while len({raw_pub(k)[0] for k in reps}) < 4:
+        reps = [Ed25519PrivateKey.generate() for _ in range(4)]
+    spots = [(48.0, -123.0), (48.5, -123.0), (49.0, -123.0), None]   # the 4th never gave a position
+    for i, (k, loc) in enumerate(zip(reps, spots)):
+        modem.inject(make_advert(k, f"Rpt{i}", m.ADV_TYPE_REPEATER, loc))
+    await asyncio.sleep(0.3)
+    check(db.repeater_location(raw_pub(reps[0])[:1]) == (48.0, -123.0)
+          and db.repeater_location(raw_pub(reps[3])[:1]) is None,
+          "repeater positions are kept from their adverts")
+    _ts[0] = int(time.time()) - 3                     # sent ~2 s ago, by the sender's clock
+    path1 = bytes(raw_pub(k)[0] for k in reps)
+    modem.inject(chan_pkt("Dave: !ping", path1))
+    await asyncio.sleep(0.4)
+    reply = channel_replies(modem)[-1]
+    hashes = ",".join(f"{b:02x}" for b in path1)
+    check(re.fullmatch(rf"MeshBot: pong @Dave \| {hashes} \(4 hops\) \| SNR: 6\.0 dB \| RSSI: -90 dBm \| "
+                       rf"111\.2km \(2 segs\) \| [23]\d\d\dms \| Rx'd: \d\d:\d\d:\d\d", reply) is not None,
+          f"multi-hop !ping: path, signal, distance over known legs, latency, time ({reply})")
+
+    # 3-byte repeater IDs (as on the owner's mesh): full IDs shown, distance still found
+    path3 = b"".join(raw_pub(k)[:3] for k in reps)
+    raw = struct.pack("<IB", int(time.time()) - 5, 0) + b"Dave: !ping"   # own timestamp, or it's a duplicate
+    mac, ct = m.encrypt_then_mac(chan._key32, raw)
+    modem.inject(bytes([(m.PAYLOAD_GRP_TXT << 2) | m.ROUTE_FLOOD, 0x80 | 4]) + path3 + bytes([chan.hash]) + mac + ct)
+    await asyncio.sleep(0.4)
+    reply = channel_replies(modem)[-1]
+    check(",".join(raw_pub(k)[:3].hex() for k in reps) + " (4 hops)" in reply and "111.2km (2 segs)" in reply,
+          f"3-byte repeater IDs shown in full, distance found ({reply})")
+
+    # a long name: the line is shortened to fit one message, keeping the key facts
+    long_name = "Somebody-With-A-Very-Long-Name"
+    _ts[0] = int(time.time()) - 3
+    raw = struct.pack("<IB", _ts[0] + 1, 0) + f"{long_name}: !ping".encode()
+    mac, ct = m.encrypt_then_mac(chan._key32, raw)
+    modem.inject(bytes([(m.PAYLOAD_GRP_TXT << 2) | m.ROUTE_FLOOD, 0x80 | 4]) + path3 + bytes([chan.hash]) + mac + ct)
+    await asyncio.sleep(0.4)
+    reply = channel_replies(modem)[-1]
+    check(len(reply.encode()) <= m.MAX_TEXT_BYTES and f"{hashes} (4 hops)" in reply
+          and "111.2km" in reply and "SNR" in reply,
+          f"long !ping line shortened to fit ({len(reply.encode())} bytes: {reply})")
 
     # --- same packet arriving twice is processed once
     dup = chan_pkt("Carol: !time")
@@ -582,6 +632,21 @@ async def main():
     check(sub is not None and bytes.fromhex(sub["pubkey"]) == alice_pub and sub["path"] == "99",   # learned from the path discovery above
           "!heartbeaton by DM subscribes her with her proven key and known route")
     db.remove_sub("Alice")
+
+    # --- an existing database (made before positions were kept) gets the new columns
+    with tempfile.TemporaryDirectory() as tmp:
+        old = os.path.join(tmp, "old.db")
+        con = sqlite3.connect(old)
+        con.execute("CREATE TABLE nodes (pubkey TEXT PRIMARY KEY, name TEXT, adv_type INTEGER, "
+                    "first_seen REAL, last_seen REAL)")
+        con.execute("INSERT INTO nodes VALUES ('aa', 'Old', 2, 1, 1)")
+        con.commit()
+        con.close()
+        olddb = m.BotDB(old)
+        cols = {r["name"] for r in olddb.db.execute("PRAGMA table_info(nodes)")}
+        check({"lat", "lon"} <= cols and olddb.repeater_location(b"\xaa") is None,
+              "existing database upgraded with position columns, old rows kept")
+        olddb.db.close()
 
     # --- everything was logged
     rx, senders, tx = db.summary()

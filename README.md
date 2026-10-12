@@ -15,7 +15,12 @@ contacts to use the channel commands.
   `East Sooke, BC: Mon: ☀️Clear 13°C 💨SW6 55%RH 💧4° 📊1018hPa | Tonight: ☁️Overcast L:6°C 💨W4`.
   Wind is km/h. Data from [Open-Meteo](https://open-meteo.com) (Environment Canada's GEM
   models, CC BY 4.0); needs internet access, and one fetch is reused for 10 minutes.
-- Command bot on a hashtag channel: `!ping` (with hop count, SNR, RSSI), `!time`, `!uptime`,
+- `!ping` replies with the route and signal, e.g.
+  `pong @VE7EIJ | 88,77,89,53,18 (5 hops) | SNR: -1.5 dB | RSSI: -118 dBm | 513.3km (4 segs) | 8158ms | Rx'd: 10:17:42`:
+  the repeaters passed through, signal as the bot heard it, distance along the legs between
+  repeaters whose positions the bot has heard advertised, the time from the sender's
+  timestamp to arrival (needs both clocks right), and when it arrived.
+- Command bot on a hashtag channel: `!ping`, `!time`, `!uptime`,
   `!stats`, `!echo <text>`, `!help`.
 - The same commands also work by **direct message** to the bot (the `!` is optional there),
   once the bot has heard the sender's advert. Replies come back as direct messages; the bot
