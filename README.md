@@ -16,9 +16,10 @@ contacts to use the channel commands.
 - The same commands also work by **direct message** to the bot (the `!` is optional there),
   once the bot has heard the sender's advert. Replies come back as direct messages; the bot
   ACKs incoming DMs like any MeshCore node, so the sender's app shows them as delivered.
-- Answers **telemetry requests**, so a companion app's **path discovery** works on the bot. It
-  reports a full battery (100 %, 4.20 V) and its uptime in seconds (as a generic sensor on
-  channel 2).
+- Answers **telemetry requests** like a companion node, so a companion app's **path discovery**
+  works on the bot. It reports a full battery (4.20 V, shown as 100 %) and, if you give
+  `--lat`/`--lon` (and optionally `--alt` in metres), a fixed GPS position. The position is a
+  command-line option so it never ends up in the code or on GitHub.
 - Opt-in direct heartbeats per user: `!heartbeaton`, `!heartbeatoff`, `!heartbeat` (status).
   Limited to 24 hours per request, renewable. Subscriptions survive restarts.
 - Everything heard and sent is logged to SQLite (timestamp, sender, text, hops, repeater path,

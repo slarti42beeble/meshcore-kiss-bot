@@ -239,13 +239,21 @@ class RemoteNode:
 
 
 def decode_lpp(buf):
-    """Minimal CayenneLPP reader for the types the bot sends: {(channel, type): value}."""
-    sizes = {116: 2, 120: 1, 100: 4}
+    """Minimal CayenneLPP reader for the types the bot sends: {(channel, type): value}.
+    Unknown types end the read, so any leftover bytes show up as ('rest', ...)."""
+    sizes = {116: 2, 136: 9}
     out, i = {}, 0
     while i + 2 <= len(buf) and buf[i + 1] in sizes:
         ch, t, n = buf[i], buf[i + 1], sizes[buf[i + 1]]
-        out[(ch, t)] = int.from_bytes(buf[i + 2:i + 2 + n], "big")
+        v = buf[i + 2:i + 2 + n]
+        if t == 136:   # GPS: lat, lon (0.0001 deg), alt (0.01 m), 3 bytes signed each
+            out[(ch, t)] = tuple(int.from_bytes(v[k:k + 3], "big", signed=True) / d
+                                 for k, d in ((0, 10000), (3, 10000), (6, 100)))
+        else:
+            out[(ch, t)] = int.from_bytes(v, "big")
         i += 2 + n
+    if buf[i:].rstrip(bytes(1)):   # trailing zeros are just AES block padding
+        out["rest"] = buf[i:].hex()
     return out
 
 
@@ -265,7 +273,8 @@ async def main():
         cooldown=0, max_replies_per_min=100, delay_min=0, delay_max=0,
         heartbeat_interval=0.5, heartbeat_hours=2.2 / 3600,   # 2.2 s "24 hours" so expiry is testable
         max_heartbeat_subs=1, advert_interval=0, ack_timeout=0.15, timezone="America/Los_Angeles",
-        flood_backoff_max=0.05)                               # 3 s cap so the backoff is testable
+        flood_backoff_max=0.05,                               # 3 s cap so the backoff is testable
+        lat=49.2827, lon=-123.1207, alt=70.5)                 # made-up fixed position for telemetry
     db = m.BotDB(":memory:")
     bot = m.Bot(args, db)
     run = asyncio.create_task(bot.run_once())
@@ -491,9 +500,7 @@ async def main():
     data = paths[-1][0] if paths else b""
     lpp = decode_lpp(data[4:])
     check(data[:4] == struct.pack("<I", 0x12345678), "response echoes the request's tag (how the app matches it)")
-    check(lpp.get((1, 120)) == 100 and lpp.get((1, 116)) == 420
-          and abs(lpp.get((2, 100), -99) - (time.time() - bot.start)) < 5,
-          f"telemetry: battery 100% / 4.20V on channel 1, bot uptime on channel 2 ({lpp})")
+    check(lpp == {(1, 116): 420}, f"path discovery (base telemetry only): just 4.20 V on channel 1 ({lpp})")
     check(db.db.execute("SELECT 1 FROM messages WHERE direction='rx' AND channel='dm:Alice' "
                         "AND command='telemetry'").fetchone() is not None
           and db.db.execute("SELECT 1 FROM messages WHERE direction='tx' AND channel='dm:Alice' "
@@ -501,11 +508,14 @@ async def main():
           "telemetry request and answer logged")
 
     before = len(alice.responses)
-    alice.send_req(0x2222, direct=True)
+    alice.send_req(0x2222, inv_mask=0x00, direct=True)   # the app's full telemetry request
     await asyncio.sleep(0.5)
     direct_resp = [r for r in alice.responses[before:] if r[2] is None]
     check(direct_resp and direct_resp[0][1] == m.ROUTE_DIRECT and direct_resp[0][0][:4] == struct.pack("<I", 0x2222),
           "telemetry request that arrived direct is answered with a direct RESPONSE")
+    lpp = decode_lpp(direct_resp[0][0][4:]) if direct_resp else {}
+    check(lpp == {(1, 116): 420, (1, 136): (49.2827, -123.1207, 70.5)},
+          f"full telemetry: voltage and --lat/--lon/--alt GPS, all on channel 1 ({lpp})")
 
     before = len(alice.responses)
     alice.send_req(0x3333, inv_mask=0xFF, path=b"\x99")   # asks for no base telemetry
