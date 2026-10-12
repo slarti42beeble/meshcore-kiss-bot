@@ -127,6 +127,14 @@ logged before this change have UTC `iso` values ending in `Z`.
   uptime/percentage/extra channels; position via `--lat/--lon/--alt`, never committed): answered for any heard node (no per-sender cooldown, global limit applies), no
   jitter so the app's round-trip timer isn't exceeded. Requests that mask out base telemetry
   get no answer, as in the firmware.
+- **`!wx`** (owner's request): fixed to East Sooke, BC (`WX_LAT/WX_LON` = the community, not the
+  owner's node). Source: Open-Meteo `gem_seamless` (free, no key; owner was told scraping The
+  Weather Network is fragile/against ToS and ECCC has no Sooke city page). Format follows the
+  owner's example, metric: `<place>: <Day>: <sky> T°C 💨<dir><km/h>[G<gust>] RH%RH 💧dew° 
+  📊hPa | Tonight: <sky> L:low°C 💨wind` (tonight = 18:00 or now -> 06:00: most common code,
+  min temp, mean wind). Fits `MAX_TEXT_BYTES` incl. the bot-name prefix; drops dew, hPa, RH
+  if needed. Cached 10 min. Slow commands may return a coroutine; `send_later` sends the
+  reply when it finishes. Tests stub `Bot.fetch_wx` (CI has no internet).
 - Message logging is a core requirement: every rx and tx row is stored, including heartbeats
   (`channel='dm:<name>'`) and adverts (`channel='advert'`).
 

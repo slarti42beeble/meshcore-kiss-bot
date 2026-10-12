@@ -257,6 +257,27 @@ def decode_lpp(buf):
     return out
 
 
+def sample_wx():
+    """Canned Open-Meteo answer (the tests never touch the internet): Monday
+    15:45, clear, 13.2 C, SW 6 km/h; tonight (18:00-06:00) mostly overcast,
+    low 6 C, W 4 km/h."""
+    times = [f"2026-10-{12 + h // 24}T{h % 24:02d}:00" for h in range(48)]
+    night = set(range(18, 30))
+    return {
+        "current": {"time": "2026-10-12T15:45", "temperature_2m": 13.2, "relative_humidity_2m": 55,
+                    "dew_point_2m": 4.4, "pressure_msl": 1017.5, "wind_speed_10m": 6.1,
+                    "wind_direction_10m": 235, "wind_gusts_10m": 7.9, "weather_code": 0, "is_day": 1},
+        "hourly": {"time": times,
+                   "temperature_2m": [6.0 if 24 <= h < 30 else 9.0 if h in night else 12.0 for h in range(48)],
+                   "weather_code": [3 if 18 <= h < 25 else 0 for h in range(48)],
+                   "wind_speed_10m": [4.0] * 48, "wind_direction_10m": [270] * 48},
+    }
+
+
+WX_EXPECTED = ("East Sooke, BC: Mon: \u2600\ufe0fClear 13\u00b0C \U0001f4a8SW6 55%RH \U0001f4a74\u00b0 "
+               "\U0001f4ca1018hPa | Tonight: \u2601\ufe0fOvercast L:6\u00b0C \U0001f4a8W4")
+
+
 def check(cond, label):
     print(("PASS  " if cond else "FAIL  ") + label)
     if not cond:
@@ -277,6 +298,15 @@ async def main():
         lat=49.2827, lon=-123.1207, alt=70.5)                 # made-up fixed position for telemetry
     db = m.BotDB(":memory:")
     bot = m.Bot(args, db)
+    wx_calls = []
+
+    def fake_fetch_wx():
+        wx_calls.append(1)
+        if bot.wx_fail:
+            raise OSError("network down")
+        return sample_wx()
+    bot.wx_fail = False
+    bot.fetch_wx = fake_fetch_wx
     run = asyncio.create_task(bot.run_once())
     await asyncio.sleep(0.5)
     modem = FakeModem.inst
@@ -305,6 +335,25 @@ async def main():
           "duplicate packet logged and answered once")
     reply = channel_replies(modem)[-1]
     check(reply.endswith((" PST", " PDT")), f"!time answers in Pacific time ({reply})")
+
+    # --- !wx (East Sooke weather; the fetch is stubbed with sample data)
+    modem.inject(chan_pkt("Carol: !wx"))
+    await asyncio.sleep(0.5)
+    reply = channel_replies(modem)[-1]
+    check(reply == "MeshBot: " + WX_EXPECTED, f"!wx answers in the channel, metric, owner's format ({reply})")
+    check(len(reply.encode("utf-8")) <= m.MAX_TEXT_BYTES, f"!wx fits in one message ({len(reply.encode())} bytes)")
+    modem.inject(chan_pkt("Carol: !wx"))
+    await asyncio.sleep(0.5)
+    check(len(wx_calls) == 1 and channel_replies(modem)[-1] == "MeshBot: " + WX_EXPECTED,
+          "a second !wx within 10 minutes is answered from the cache (one fetch)")
+    trimmed = m.format_wx(sample_wx(), 100)
+    check(len(trimmed.encode()) <= 100 and "Tonight" in trimmed and "\U0001f4a7" not in trimmed,
+          f"if space is short, the least useful parts are dropped first ({len(trimmed.encode())} bytes)")
+    bot.wx_cache, bot.wx_fail = None, True
+    modem.inject(chan_pkt("Carol: !wx"))
+    await asyncio.sleep(0.5)
+    check("weather unavailable" in channel_replies(modem)[-1], "!wx says so if the weather service can't be reached")
+    bot.wx_fail = False
 
     # --- !heartbeaton before any advert has been heard
     modem.inject(chan_pkt("Alice: !heartbeaton", b"\x11\x22"))
@@ -470,6 +519,11 @@ async def main():
     check((ack3, m.ROUTE_DIRECT) in alice.acks_received[before:], "DM that arrived direct is ACKed direct")
     check([t for p, a, t in dms_in(modem, n, alice_secret) if t.endswith((" PST", " PDT"))],
           "'time' without the ! works by DM")
+
+    n = len(modem.sent)
+    alice.send_dm("wx", ts + 4, direct=True)
+    await asyncio.sleep(0.5)
+    check(WX_EXPECTED in [t for p, a, t in dms_in(modem, n, alice_secret)], "'wx' works by DM too")
 
     n = len(modem.sent)
     alice.send_dm("heartbeatof", ts + 3, direct=True)   # a typo
