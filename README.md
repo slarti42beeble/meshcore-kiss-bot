@@ -20,6 +20,9 @@ contacts to use the channel commands.
   the repeaters passed through, signal as the bot heard it, distance along the legs between
   repeaters whose positions the bot has heard advertised, the time from the sender's
   timestamp to arrival (needs both clocks right), and when it arrived.
+- `!8ball <question>`: one of the Magic 8-Ball's 20 classic answers, at random.
+- Replies too long for one message (e.g. `!help` with a long bot name) are split into
+  numbered messages: `(1/2) ...`, `(2/2) ...`.
 - Command bot on a hashtag channel: `!ping`, `!time`, `!uptime`,
   `!stats`, `!echo <text>`, `!help`.
 - The same commands also work by **direct message** to the bot (the `!` is optional there),
