@@ -95,6 +95,7 @@ import logging.handlers
 import math
 import os
 import random
+import re
 import sqlite3
 import struct
 import sys
@@ -673,6 +674,13 @@ class BotDB:
             (now, excluding)).fetchone()[0]
 
 
+def as_messages(reply):
+    """A command's reply as a list of messages: None -> [], "text" -> ["text"]."""
+    if not reply:
+        return []
+    return [reply] if isinstance(reply, str) else list(reply)
+
+
 def fmt_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
@@ -681,6 +689,41 @@ def fmt_duration(seconds: float) -> str:
 # --------------------------------------------------------------------------
 # !wx: East Sooke weather from Open-Meteo (free, no key; https://open-meteo.com)
 # --------------------------------------------------------------------------
+
+# the classic Magic 8-Ball's 20 answers: 10 yes, 5 maybe, 5 no
+EIGHT_BALL = [
+    "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes definitely.",
+    "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.", "Yes.",
+    "Signs point to yes.",
+    "Reply hazy, try again.", "Ask again later.", "Better not tell you now.",
+    "Cannot predict now.", "Concentrate and ask again.",
+    "Don't count on it.", "My reply is no.", "My sources say no.", "Outlook not so good.",
+    "Very doubtful.",
+]
+
+
+def split_reply(text: str, limit: int):
+    """Text that fits in `limit` bytes is returned as is; longer text is split
+    into numbered messages, ["(1/2) ...", "(2/2) ..."], between sentences if
+    they fit, otherwise between words."""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    sentences = re.split(r"(?<=[.!?]) ", text)
+    for tag_len in (6, 8):                 # "(1/2) " up to 9 parts, "(10/12) " beyond
+        room = limit - tag_len
+        units = sentences if all(len(u.encode("utf-8")) <= room for u in sentences) else text.split(" ")
+        parts, cur = [], ""
+        for unit in units:
+            joined = f"{cur} {unit}" if cur else unit
+            if cur and len(joined.encode("utf-8")) > room:
+                parts.append(cur)
+                joined = unit
+            cur = joined
+        parts.append(cur)
+        if len(parts) <= 9:
+            break
+    return [f"({i}/{len(parts)}) {p}" for i, p in enumerate(parts, 1)]
+
 
 WX_PLACE = "East Sooke, BC"
 WX_LAT, WX_LON = 48.37, -123.68    # the East Sooke community, not anyone's node
@@ -829,8 +872,7 @@ class Bot:
         # commands like !wx; the reply is then sent when it finishes)
         self.commands = {
             "!ping": self.cmd_ping,
-            "!help": lambda c: ("Commands: !ping !wx !time !uptime !stats !echo <text> !heartbeaton "
-                                "!heartbeatoff !heartbeat. These commands also work by DM to me."),
+            "!help": self.cmd_help,
             "!time": lambda c: datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
             "!uptime": lambda c: f"up {fmt_duration(time.time() - self.start)}",
             "!stats": self.cmd_stats,
@@ -839,6 +881,7 @@ class Bot:
             "!heartbeatoff": self.cmd_heartbeat_off,
             "!heartbeat": self.cmd_heartbeat_status,
             "!wx": self.cmd_wx,
+            "!8ball": lambda c: f"\U0001f3b1 @{c['sender']} {random.choice(EIGHT_BALL)}",
         }
 
     # ---- commands
@@ -859,12 +902,21 @@ class Bot:
         with urllib.request.urlopen(url, timeout=10) as r:
             return json.load(r)
 
+    def reply_limit(self) -> int:
+        """Bytes a reply may use: a channel post carries "<bot name>: " in front."""
+        return MAX_TEXT_BYTES - len(self.name.encode("utf-8")) - 2
+
+    def cmd_help(self, c):
+        return split_reply("Commands: !ping !wx !8ball !time !uptime !stats !echo <text> !heartbeaton "
+                           "!heartbeatoff !heartbeat. These commands also work by DM to me.",
+                           self.reply_limit())
+
     def send_later(self, reply, send):
         """Finish a slow command's reply (a coroutine) in the background, then
-        hand the text to send() (which may itself be async)."""
+        hand the text, or each of several texts, to send() (which may itself
+        be async)."""
         async def finish():
-            text = await reply
-            if text:
+            for text in as_messages(await reply):
                 result = send(text)
                 if asyncio.iscoroutine(result):
                     await result
@@ -1127,8 +1179,9 @@ class Bot:
             "path": pkt["path"], "plb": pkt["plb"], "sender_ts": sender_ts, "rx_time": rx_time})
         if asyncio.iscoroutine(reply):
             self.send_later(reply, lambda text: self.enqueue(text, reply_to=row_id, cmd=cmd))
-        elif reply is not None:
-            self.enqueue(reply, reply_to=row_id, cmd=cmd)
+        else:
+            for text in as_messages(reply):     # a long reply may be several messages
+                self.enqueue(text, reply_to=row_id, cmd=cmd)
 
     def reply_allowed(self, sender, what, per_sender=True) -> bool:
         """The airtime limits: per-sender cooldown (optional), global replies
@@ -1317,8 +1370,9 @@ class Bot:
             return self.send_direct(self.peer(name, pub), text, cmd, reply_to=row_id, jitter=True)
         if asyncio.iscoroutine(reply):
             self.send_later(reply, send)
-        elif reply is not None:
-            await send(reply)
+        else:
+            for text in as_messages(reply):
+                await send(text)
 
     # ---- serial tasks
     async def serial_reader(self):

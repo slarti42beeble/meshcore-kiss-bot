@@ -405,6 +405,34 @@ async def main():
     check("weather unavailable" in channel_replies(modem)[-1], "!wx says so if the weather service can't be reached")
     bot.wx_fail = False
 
+    # --- !8ball
+    modem.inject(chan_pkt("Carol: !8ball will it rain?"))
+    await asyncio.sleep(0.4)
+    reply = channel_replies(modem)[-1]
+    check(len(m.EIGHT_BALL) == 20 and reply.startswith("MeshBot: 🎱 @Carol ")
+          and reply.split("@Carol ", 1)[1] in m.EIGHT_BALL, f"!8ball gives one of the 20 answers ({reply})")
+    picks = {bot.commands["!8ball"]({"sender": "x"}) for _ in range(300)}
+    check(len(picks) > 15, f"!8ball answers vary ({len(picks)} different in 300 tries)")
+
+    # --- !help: one message with the usual name; split (1/2), (2/2) when the name makes it too long
+    modem.inject(chan_pkt("Carol: !help"))
+    await asyncio.sleep(0.4)
+    reply = channel_replies(modem)[-1]
+    check(reply.startswith("MeshBot: Commands:") and "!8ball" in reply and len(reply.encode()) <= m.MAX_TEXT_BYTES,
+          f"!help fits in one message with the name MeshBot ({len(reply.encode())} bytes)")
+    bot.name = "EastSookeWeatherBot"
+    modem.inject(chan_pkt("Carol: !help"))
+    await asyncio.sleep(0.5)
+    two = channel_replies(modem)[-2:]
+    bot.name = "MeshBot"
+    check(two[0].startswith("EastSookeWeatherBot: (1/2) Commands:") and two[0].endswith("!heartbeat.")
+          and two[1] == "EastSookeWeatherBot: (2/2) These commands also work by DM to me."
+          and all(len(t.encode()) <= m.MAX_TEXT_BYTES for t in two),
+          f"!help split into (1/2) and (2/2) at a sentence when too long ({two})")
+    parts = m.split_reply("word " * 80, 60)
+    check(len(parts) > 1 and all(len(t.encode()) <= 60 for t in parts) and parts[-1].startswith(f"({len(parts)}/{len(parts)})"),
+          "a long reply with no sentence breaks is split between words, each part within the limit")
+
     # --- !heartbeaton before any advert has been heard
     modem.inject(chan_pkt("Alice: !heartbeaton", b"\x11\x22"))
     await asyncio.sleep(0.4)
@@ -574,6 +602,12 @@ async def main():
     alice.send_dm("wx", ts + 4, direct=True)
     await asyncio.sleep(0.5)
     check(WX_EXPECTED in [t for p, a, t in dms_in(modem, n, alice_secret)], "'wx' works by DM too")
+
+    n = len(modem.sent)
+    alice.send_dm("8ball", ts + 5, direct=True)
+    await asyncio.sleep(0.5)
+    check([t for p, a, t in dms_in(modem, n, alice_secret) if t.split("@Alice ", 1)[-1] in m.EIGHT_BALL],
+          "'8ball' works by DM too")
 
     n = len(modem.sent)
     alice.send_dm("heartbeatof", ts + 3, direct=True)   # a typo

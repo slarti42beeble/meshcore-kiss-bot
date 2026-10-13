@@ -34,7 +34,10 @@ logged before this change have UTC `iso` values ending in `Z`.
   - companion app "path discovery" (2026-10-11): the flooded telemetry request is answered and
     the app shows the route to the bot;
   - full telemetry requests (2026-10-11): the app shows Voltage 4.200 V / 100 % and the
-    `--lat/--lon/--alt` GPS position, with no channel headings, like a real companion node.
+    `--lat/--lon/--alt` GPS position, with no channel headings, like a real companion node;
+  - `!wx` (2026-10-12): live Open-Meteo fetch and reply on the radio;
+  - new `!ping` format (2026-10-12), seen at 0 hops (the owner is next to the bot). Multi-hop
+    paths, 3-byte IDs in the reply, distance and shortening are so far only simulated.
 - **Not yet seen on air:** the no-ACK path (flood fallback, route learning from PATH replies,
   flood backoff). There has been no `no_ack` row yet, so these are proven only by the
   simulated-modem test, which shows the code is self-consistent, not that firmware agrees.
@@ -135,6 +138,10 @@ logged before this change have UTC `iso` values ending in `Z`.
   if no leg is known. ms = receive time - sender timestamp (omitted if negative or > 1 h).
   Shortening order to fit: 1-byte hashes, drop Rx'd, ms, RSSI. In DMs the route shown is the
   one we hold for them (a direct packet's path is used up on the way).
+- **`!8ball`**: random one of the classic 20 answers (`EIGHT_BALL`): `🎱 @name <answer>`.
+- **Long replies**: a handler may return a list of messages; `split_reply` splits text that
+  won't fit `reply_limit()` (150 bytes minus `"<bot name>: "`) at spaces into `(1/2) ...`,
+  `(2/2) ...` (owner's request, for `!help`). With the name `MeshBot`, help still fits in one.
 - **`!wx`** (owner's request): fixed to East Sooke, BC (`WX_LAT/WX_LON` = the community, not the
   owner's node). Source: Open-Meteo `gem_seamless` (free, no key; owner was told scraping The
   Weather Network is fragile/against ToS and ECCC has no Sooke city page). Format follows the
