@@ -37,7 +37,9 @@ logged before this change have UTC `iso` values ending in `Z`.
     `--lat/--lon/--alt` GPS position, with no channel headings, like a real companion node;
   - `!wx` (2026-10-12): live Open-Meteo fetch and reply on the radio;
   - new `!ping` format (2026-10-12), seen at 0 hops (the owner is next to the bot). Multi-hop
-    paths, 3-byte IDs in the reply, distance and shortening are so far only simulated.
+    paths, 3-byte IDs in the reply, distance and shortening are so far only simulated;
+  - `!8ball` (2026-10-12). The `(1/2)`/`(2/2)` reply split hasn't triggered on air yet (help
+    still fits in one message with the name `MeshBot`).
 - **Not yet seen on air:** the no-ACK path (flood fallback, route learning from PATH replies,
   flood backoff). There has been no `no_ack` row yet, so these are proven only by the
   simulated-modem test, which shows the code is self-consistent, not that firmware agrees.
