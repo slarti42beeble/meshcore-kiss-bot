@@ -925,7 +925,7 @@ class Bot:
         task.add_done_callback(self.bg_tasks.discard)
 
     def cmd_ping(self, c):
-        """pong @name | 88,77,89 (3 hops) | SNR: -1.5 dB | RSSI: -118 dBm |
+        """🏓 pong @name | 88,77,89 (3 hops) | SNR: -1.5 dB | RSSI: -118 dBm |
         51.3km (2 segs) | 815ms | Rx'd: 10:17:42. Distance adds up the legs
         between consecutive repeaters on the path whose positions we've heard
         advertised; the ms are from the sender's timestamp to our receiving it
@@ -960,7 +960,7 @@ class Bot:
         limit = MAX_TEXT_BYTES - len(self.name.encode("utf-8")) - 2   # room for "<bot name>: "
 
         def line():
-            return " | ".join([f"pong @{c['sender']}"] + [t for _, t in parts])
+            return " | ".join([f"🏓 pong @{c['sender']}"] + [t for _, t in parts])
         for step in ("short", "rx", "ms", "rssi"):
             if len(line().encode("utf-8")) <= limit:
                 break

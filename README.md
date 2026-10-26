@@ -16,7 +16,7 @@ contacts to use the channel commands.
   Wind is km/h. Data from [Open-Meteo](https://open-meteo.com) (Environment Canada's GEM
   models, CC BY 4.0); needs internet access, and one fetch is reused for 10 minutes.
 - `!ping` replies with the route and signal, e.g.
-  `pong @VE7EIJ | 88,77,89,53,18 (5 hops) | SNR: -1.5 dB | RSSI: -118 dBm | 513.3km (4 segs) | 8158ms | Rx'd: 10:17:42`:
+  `🏓 pong @VE7EIJ | 88,77,89,53,18 (5 hops) | SNR: -1.5 dB | RSSI: -118 dBm | 513.3km (4 segs) | 8158ms | Rx'd: 10:17:42`:
   the repeaters passed through, signal as the bot heard it, distance along the legs between
   repeaters whose positions the bot has heard advertised, the time from the sender's
   timestamp to arrival (needs both clocks right), and when it arrived.
