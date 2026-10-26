@@ -133,7 +133,7 @@ logged before this change have UTC `iso` values ending in `Z`.
   uptime/percentage/extra channels; position via `--lat/--lon/--alt`, never committed): answered for any heard node (no per-sender cooldown, global limit applies), no
   jitter so the app's round-trip timer isn't exceeded. Requests that mask out base telemetry
   get no answer, as in the firmware.
-- **`!ping`** (owner's format): `pong @name | <hashes> (N hops) | SNR: x dB | RSSI: y dBm |
+- **`!ping`** (owner's format): `🏓 pong @name | <hashes> (N hops) | SNR: x dB | RSSI: y dBm |
   <km> (n segs) | <ms> | Rx'd: HH:MM:SS`. Hashes shown as on air (1-3 bytes each; first byte
   only if space is short). km = sum of legs between consecutive path repeaters with a known
   advertised position (repeater = adv_type 2, matched by hash prefix, only if unique); omitted

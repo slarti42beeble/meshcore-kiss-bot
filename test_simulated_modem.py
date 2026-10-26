@@ -350,7 +350,7 @@ async def main():
     await asyncio.sleep(0.4)
     reply = channel_replies(modem)[-1]
     hashes = ",".join(f"{b:02x}" for b in path1)
-    check(re.fullmatch(rf"MeshBot: pong @Dave \| {hashes} \(4 hops\) \| SNR: 6\.0 dB \| RSSI: -90 dBm \| "
+    check(re.fullmatch(rf"MeshBot: 🏓 pong @Dave \| {hashes} \(4 hops\) \| SNR: 6\.0 dB \| RSSI: -90 dBm \| "
                        rf"111\.2km \(2 segs\) \| [23]\d\d\dms \| Rx'd: \d\d:\d\d:\d\d", reply) is not None,
           f"multi-hop !ping: path, signal, distance over known legs, latency, time ({reply})")
 
