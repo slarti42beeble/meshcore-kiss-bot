@@ -29,6 +29,11 @@ import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Replies contain emoji; a Windows console (cp1252) can't print them otherwise.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # noqa: E402
